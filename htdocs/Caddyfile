@@ -1,0 +1,19 @@
+https://localhost:8443 {
+    root * E:/PHP/copiloto/produção/CRM/public
+    encode zstd gzip
+
+    php_fastcgi 127.0.0.1:9000
+    @static {
+        path *.css *.js *.png *.jpg *.jpeg *.svg *.webp *.gif *.ico *.woff *.woff2 *.ttf *.eot *.map
+    }
+
+    header @static Cache-Control "public, max-age=2592000, immutable"
+
+    file_server
+
+    tls internal
+
+    header {
+        defer
+    }
+}

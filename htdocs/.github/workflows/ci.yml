@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  php:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          tools: composer:v2
+
+      - name: Validate composer.json
+        run: composer validate --no-interaction --no-check-publish
+
+      - name: Install dependencies (no scripts)
+        run: composer install --no-interaction --prefer-dist --no-progress --no-scripts
+
+      - name: PHP syntax check (excluding vendor)
+        run: |
+          find . -name '*.php' -not -path './vendor/*' -print0 | xargs -0 -n 1 php -l

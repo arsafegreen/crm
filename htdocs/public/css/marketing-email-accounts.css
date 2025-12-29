@@ -1,0 +1,252 @@
+header.email-accounts {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 18px;
+    flex-wrap: wrap;
+}
+
+header.email-accounts h1 {
+    margin: 0;
+}
+
+header.email-accounts p {
+    color: var(--muted);
+    margin: 6px 0 0;
+    max-width: 640px;
+}
+
+header.email-accounts .actions {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+}
+
+.email-summary {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 12px;
+}
+
+.email-summary-card {
+    border: 1px solid var(--border);
+    border-radius: 18px;
+    padding: 18px;
+    background: rgba(15, 23, 42, 0.6);
+    box-shadow: var(--shadow);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.email-summary-card span {
+    color: var(--muted);
+    font-size: 0.8rem;
+}
+
+.email-summary-card strong {
+    font-size: 1.6rem;
+}
+
+.email-inbox-cta {
+    border-radius: 20px;
+    padding: 20px;
+    background: rgba(14, 165, 233, 0.12);
+    border: 1px solid rgba(14, 165, 233, 0.35);
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.email-inbox-cta ul {
+    margin: 0;
+    padding-left: 18px;
+    color: var(--muted);
+}
+
+.email-account-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+    gap: 16px;
+}
+
+.email-account-card {
+    border: 1px solid var(--border);
+    border-radius: 24px;
+    padding: 20px;
+    background: rgba(15, 23, 42, 0.68);
+    box-shadow: var(--shadow);
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+}
+
+.status-pill {
+    padding: 4px 12px;
+    border-radius: 999px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.status-pill.active {
+    background: rgba(34, 197, 94, 0.18);
+    color: #86efac;
+}
+
+.status-pill.paused {
+    background: rgba(251, 191, 36, 0.18);
+    color: #facc15;
+}
+
+.status-pill.disabled {
+    background: rgba(248, 113, 113, 0.15);
+    color: #fecaca;
+}
+
+.status-pill.ready {
+    background: rgba(14, 165, 233, 0.2);
+    color: #bae6fd;
+}
+
+.status-pill.warming {
+    background: rgba(251, 146, 60, 0.18);
+    color: #fdba74;
+}
+
+.status-pill.cooldown {
+    background: rgba(147, 197, 253, 0.18);
+    color: #bfdbfe;
+}
+
+.email-account-stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+    gap: 10px;
+    padding: 14px;
+    border-radius: 16px;
+    background: rgba(30, 41, 59, 0.65);
+    border: 1px solid rgba(148, 163, 184, 0.2);
+}
+
+.email-account-stats span {
+    color: var(--muted);
+    font-size: 0.75rem;
+}
+
+.email-account-stats strong {
+    font-size: 1.1rem;
+}
+
+.email-account-matrix {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 12px;
+    padding: 14px;
+    border-radius: 16px;
+    background: rgba(15, 23, 42, 0.45);
+    border: 1px solid rgba(148, 163, 184, 0.18);
+}
+
+.email-account-matrix small {
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    font-size: 0.7rem;
+}
+
+.email-account-meta-list {
+    list-style: none;
+    margin: 6px 0 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 0.9rem;
+}
+
+.email-account-meta-list li {
+    color: var(--text);
+}
+
+.pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    font-size: 0.75rem;
+    background: rgba(15, 23, 42, 0.75);
+    border: 1px solid rgba(148, 163, 184, 0.3);
+}
+
+.guide-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 14px;
+}
+
+.guide-card {
+    border: 1px solid rgba(148, 163, 184, 0.3);
+    border-radius: 18px;
+    padding: 16px;
+    background: rgba(15, 23, 42, 0.5);
+}
+
+.guide-card h3 {
+    margin: 0 0 6px;
+    font-size: 1rem;
+}
+
+.guide-card p {
+    margin: 0;
+    color: var(--muted);
+    font-size: 0.9rem;
+}
+
+.account-extra {
+    border: 1px solid rgba(148, 163, 184, 0.35);
+    border-radius: 18px;
+    background: rgba(15, 23, 42, 0.45);
+    overflow: hidden;
+}
+
+.account-extra summary {
+    cursor: pointer;
+    list-style: none;
+    padding: 12px 16px;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.account-extra summary::marker,
+.account-extra summary::-webkit-details-marker {
+    display: none;
+}
+
+.account-extra[open] summary {
+    border-bottom: 1px solid rgba(148, 163, 184, 0.25);
+    margin-bottom: 8px;
+}
+
+.account-extra-content {
+    padding: 0 16px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+}
+
+@media (max-width: 720px) {
+    header.email-accounts {
+        flex-direction: column;
+    }
+
+    header.email-accounts .actions {
+        justify-content: flex-start;
+    }
+}

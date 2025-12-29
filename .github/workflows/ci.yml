@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  php:
+    name: PHP ${{ matrix.php-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php-version: ['8.2', '8.3']
+    defaults:
+      run:
+        working-directory: htdocs
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup PHP ${{ matrix.php-version }}
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php-version }}
+          coverage: none
+          tools: composer
+          extensions: mbstring, intl, gd, pdo_mysql
+          ini-values: memory_limit=1G
+          cache: composer
+
+      - name: Validate composer.json
+        run: composer validate --no-check-all
+
+      - name: Install dependencies
+        run: composer install --no-interaction --no-progress --prefer-dist
+
+      - name: Optimize autoload
+        run: composer dump-autoload -o
+
+      - name: Lint PHP
+        run: |
+          find . -name '*.php' -not -path './vendor/*' -print0 | xargs -0 -n1 php -l
+
+      - name: Run tests (phpunit if present)
+        run: |
+          if [ -f vendor/bin/phpunit ]; then
+            vendor/bin/phpunit --colors=always
+          else
+            echo "phpunit not found, skipping"
+          fi

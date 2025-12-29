@@ -1,0 +1,85 @@
+# Ignore tudo na raiz por padrão e reabilite apenas o que importa
+/*
+!.gitignore
+!README.md
+!.github/
+!htdocs/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# VS Code local state
+.vscode/
+
+# Binaries e instaladores
+*.exe
+*.bak
+*.tmp
+uninstall.dat
+uninstall.exe
+
+# XAMPP / serviços e binários
+apache/
+php/
+phpMyAdmin/
+mysql/
+tomcat/
+sendmail/
+MercuryMail/
+FileZillaFTP/
+webdav/
+webalizer/
+mailoutput/
+mailtodisk/
+anonymous/
+tmp/
+backups/
+cgi-bin/
+contrib/
+install/
+licenses/
+locale/
+perl/
+img/
+src/
+
+# Scripts de controle XAMPP
+apache_start.bat
+apache_stop.bat
+catalina_*.bat
+filezilla_*.bat
+mercury_*.bat
+mysql_*.bat
+xampp_*
+setup_xampp.bat
+ctlscript.bat
+test_php.bat
+service.exe
+passwords.txt
+properties.ini
+readme_*.txt
+
+# PHP / Composer (root-level)
+vendor/
+.env
+.env.*
+
+# App data and deps under htdocs
+htdocs/vendor/
+htdocs/.env
+htdocs/.env.*
+htdocs/storage/
+htdocs/tmp/
+htdocs/public/uploads/
+
+# Node / frontend
+node_modules/
+
+# Python venvs
+.venv/
+
+# Local data
+*.log

@@ -1,0 +1,24 @@
+{
+  "name": "whatsapp-web-gateway",
+  "version": "0.1.0",
+  "description": "Gateway alternativo baseado em WhatsApp Web para integrar com o CRM",
+  "main": "src/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "NODE_ENV=development node src/index.js"
+  },
+  "dependencies": {
+    "@wppconnect-team/wppconnect": "^1.28.1",
+    "axios": "^1.6.7",
+    "dotenv": "^16.4.1",
+    "express": "^4.19.2",
+    "mysql2": "^3.9.7",
+    "qrcode": "^1.5.4",
+    "winston": "^3.10.0",
+    "zod": "^3.22.4"
+  },
+  "optionalDependencies": {
+    "better-sqlite3": "^12.5.0"
+  }
+}

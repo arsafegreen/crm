@@ -1,0 +1,221 @@
+:root {
+    --chat-trigger-bg: linear-gradient(120deg, var(--accent, #00e0ff), var(--accent-strong, #9b3cff));
+    --chat-panel-bg: rgba(3, 12, 34, 0.95);
+    --chat-panel-border: rgba(255, 255, 255, 0.08);
+    --chat-panel-radius: 16px;
+    --chat-surface: rgba(255, 255, 255, 0.05);
+    --chat-text: var(--text, #eaf4ff);
+    --chat-muted: var(--muted, #9bb6d4);
+}
+
+.floating-chat {
+    position: fixed;
+    bottom: 18px;
+    right: 18px;
+    z-index: 20;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 10px;
+}
+
+.floating-chat.is-standalone {
+    position: static;
+    width: 100%;
+    max-width: 480px;
+    margin: 0 auto;
+    align-items: stretch;
+}
+
+.floating-chat[data-chat-standalone="true"] .floating-trigger {
+    display: none;
+}
+
+.floating-chat [hidden] {
+    display: none !important;
+}
+
+.floating-trigger {
+    border: none;
+    border-radius: 999px;
+    padding: 12px 18px;
+    background: var(--chat-trigger-bg);
+    color: #010511;
+    font-weight: 600;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+    box-shadow: 0 20px 35px rgba(0, 224, 255, 0.35);
+}
+
+.floating-panel {
+    width: min(360px, 90vw);
+    background: var(--chat-panel-bg);
+    border: 1px solid var(--chat-panel-border);
+    border-radius: var(--chat-panel-radius);
+    padding: 20px;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.45);
+}
+
+.floating-chat.is-standalone .floating-panel {
+    width: 100%;
+}
+
+.floating-chat.is-standalone input,
+.floating-chat.is-standalone textarea {
+    background: #fff;
+    color: #0b1a2c;
+}
+
+.floating-panel header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 12px;
+}
+
+.floating-panel header h4 {
+    margin: 0;
+    font-size: 1rem;
+}
+
+.floating-close {
+    border: none;
+    background: transparent;
+    color: var(--chat-muted);
+    font-size: 1.2rem;
+    cursor: pointer;
+}
+
+.floating-panel form label {
+    font-size: 0.8rem;
+    color: var(--chat-muted);
+}
+
+.floating-panel input,
+.floating-panel textarea {
+    border-radius: 10px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    background: rgba(255, 255, 255, 0.02);
+    color: var(--chat-text);
+    font-family: inherit;
+    width: 100%;
+    padding: 10px 12px;
+}
+
+.floating-feedback {
+    margin-top: 8px;
+    font-size: 0.85rem;
+    color: var(--success, #66f8c7);
+}
+
+.floating-session {
+    margin-top: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.floating-status {
+    margin-top: 12px;
+    padding: 12px 14px;
+    border-radius: 16px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    background: var(--chat-surface);
+}
+
+.floating-status strong {
+    font-size: 0.9rem;
+    color: var(--chat-text);
+    display: block;
+}
+
+.floating-status small {
+    display: block;
+    margin-top: 4px;
+    color: var(--chat-muted);
+}
+
+.floating-messages {
+    max-height: 280px;
+    overflow-y: auto;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 16px;
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    background: rgba(3, 12, 34, 0.7);
+}
+
+.floating-message {
+    border-radius: 12px;
+    padding: 10px 12px;
+    font-size: 0.9rem;
+    line-height: 1.4;
+}
+
+.floating-message header {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-bottom: 4px;
+    color: var(--chat-muted);
+}
+
+.floating-message.agent {
+    background: rgba(14, 165, 233, 0.12);
+    border: 1px solid rgba(14, 165, 233, 0.2);
+    align-self: flex-start;
+}
+
+.floating-message.visitor {
+    background: rgba(102, 248, 199, 0.12);
+    border: 1px solid rgba(102, 248, 199, 0.2);
+    align-self: flex-end;
+}
+
+.floating-message.system {
+    background: rgba(148, 163, 184, 0.12);
+    border: 1px solid rgba(148, 163, 184, 0.2);
+    text-align: center;
+    align-self: center;
+}
+
+.floating-reply {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.floating-reply textarea {
+    border-radius: 12px;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    background: rgba(255, 255, 255, 0.02);
+    color: var(--chat-text);
+    padding: 10px 12px;
+    resize: vertical;
+}
+
+.sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    border: 0;
+}
+
+@media (max-width: 640px) {
+    .floating-chat {
+        right: 16px;
+        left: 16px;
+    }
+
+    .floating-panel {
+        width: 100%;
+    }
+}

@@ -1,0 +1,8 @@
+/vendor/
+/.env
+/storage/cache/*
+/storage/logs/*
+/storage/uploads/*
+/storage/database.sqlite
+.idea/
+.vscode/
