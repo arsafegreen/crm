@@ -74,6 +74,33 @@ final class WhatsappContactRepository
         return $rows !== false ? $rows : [];
     }
 
+    /**
+     * Lista contatos com snapshot potencialmente obsoleto para refresh de foto.
+     * Critério: metadata faltando gateway_snapshot_at ou last_interaction_at muito antigo.
+     *
+     * @return array<int, array<string,mixed>>
+     */
+    public function listForSnapshotRefresh(int $thresholdTimestamp, int $limit = 100): array
+    {
+        $limit = max(1, $limit);
+        $thresholdTimestamp = max(0, $thresholdTimestamp);
+
+        $sql =
+            'SELECT * FROM whatsapp_contacts
+             WHERE (metadata IS NULL OR metadata NOT LIKE "%gateway_snapshot_at%" OR metadata = "")
+                OR COALESCE(last_interaction_at, updated_at, created_at, 0) < :threshold
+             ORDER BY COALESCE(last_interaction_at, updated_at, created_at, 0) DESC
+             LIMIT :limit';
+
+        $stmt = $this->pdo->prepare($sql);
+        $stmt->bindValue(':threshold', $thresholdTimestamp, PDO::PARAM_INT);
+        $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
+        $stmt->execute();
+
+        $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        return $rows !== false ? $rows : [];
+    }
+
     public function findOrCreate(string $phone, array $attributes = []): array
     {
         $normalizedPhone = $this->normalizePhone($phone);

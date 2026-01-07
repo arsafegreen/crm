@@ -7,6 +7,7 @@ namespace App\Controllers;
 use App\Auth\AuthenticatedUser;
 use App\Repositories\UserRepository;
 use App\Services\ChatService;
+use Symfony\Component\HttpFoundation\File\UploadedFile;
 use Symfony\Component\HttpFoundation\RedirectResponse;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Response;
@@ -92,7 +93,17 @@ final class ChatController
             return json_response(['error' => 'Não autenticado.'], 401);
         }
 
-        $threads = $this->chatService->threadsForSidebar($user);
+        // Temporary debug to trace 500s in /chat/threads
+        error_log('[chat/threads] start user=' . $user->id);
+        try {
+            $threads = $this->chatService->threadsForSidebar($user);
+        } catch (\Throwable $e) {
+            // Capture unexpected failures hitting /chat/threads while we track the 500
+            error_log('[chat/threads] ' . $e->getMessage() . ' @ ' . $e->getFile() . ':' . $e->getLine());
+            error_log($e->getTraceAsString());
+            return json_response(['error' => 'Erro interno ao carregar conversas.'], 500);
+        }
+        error_log('[chat/threads] ok user=' . $user->id . ' threads=' . count($threads));
         return json_response(['threads' => $threads]);
     }
 
@@ -185,7 +196,10 @@ final class ChatController
         }
 
         $body = (string)$request->request->get('body', '');
-        $result = $this->chatService->sendMessage($threadId, $body, $user);
+        $uploaded = $request->files->get('attachment');
+        $attachment = $uploaded instanceof UploadedFile ? $uploaded : null;
+
+        $result = $this->chatService->sendMessage($threadId, $body, $user, $attachment);
 
         if (isset($result['errors'])) {
             return json_response(['errors' => $result['errors']], 422);

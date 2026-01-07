@@ -5,6 +5,7 @@
 /** @var array $statusLabels */
 /** @var int $perPage */
 /** @var array $yearOptions */
+/** @var array $issueYearOptions */
 /** @var string|null $viewMode */
 /** @var string|null $offScope */
 /** @var array $partnerIndicators */
@@ -39,6 +40,7 @@ $buildQuery = static function (array $overrides = []) use ($filters, $perPage, $
             'expiration_year' => (int)($filters['expiration_month'] ?? 0) > 0 ? ($filters['expiration_year'] ?? '') : '',
             'expiration_date' => $filters['expiration_date'] ?? '',
             'document_type' => $filters['document_type'] ?? '',
+            'issue_year' => $filters['issue_year'] ?? '',
             'birthday_month' => (int)($filters['birthday_month'] ?? 0) > 0 ? ($filters['birthday_month'] ?? '') : '',
             'birthday_day' => (int)($filters['birthday_day'] ?? 0) > 0 ? ($filters['birthday_day'] ?? '') : '',
             'off_scope' => $filters['off_scope'] ?? '',
@@ -160,10 +162,21 @@ if (!in_array($selectedExpirationYear, array_map('intval', $yearOptions), true))
     $yearOptions[] = $selectedExpirationYear;
     sort($yearOptions);
 }
+$issueYearOptions = $issueYearOptions ?? range(2020, 2045);
+$selectedIssueYear = (int)($filters['issue_year'] ?? 0);
+if ($selectedIssueYear !== 0 && !in_array($selectedIssueYear, array_map('intval', $issueYearOptions), true)) {
+    $issueYearOptions[] = $selectedIssueYear;
+    sort($issueYearOptions);
+}
 $selectedDocumentType = (string)($filters['document_type'] ?? '');
 if (!in_array($selectedDocumentType, ['', 'cpf', 'cnpj'], true)) {
     $selectedDocumentType = '';
 }
+
+$documentCounts = [
+    'cnpj' => (int)($meta['document_counts']['cnpj'] ?? 0),
+    'cpf' => (int)($meta['document_counts']['cpf'] ?? 0),
+];
 ?>
 
 <header>
@@ -518,6 +531,16 @@ document.addEventListener('DOMContentLoaded', function () {
                 </select>
             </label>
             <label style="display:flex;flex-direction:column;gap:8px;font-size:0.85rem;color:var(--muted);">
+                Emitidos no ano
+                <select name="issue_year" style="padding:12px;border-radius:12px;border:1px solid var(--border);background:rgba(15,23,42,0.58);color:var(--text);">
+                    <option value="0" <?= $selectedIssueYear === 0 ? 'selected' : ''; ?>>Todos os anos</option>
+                    <?php foreach ($issueYearOptions as $yearOption): ?>
+                        <option value="<?= (int)$yearOption; ?>" <?= (int)$yearOption === $selectedIssueYear ? 'selected' : ''; ?>><?= (int)$yearOption; ?></option>
+                    <?php endforeach; ?>
+                </select>
+                <span style="font-size:0.75rem;color:rgba(148,163,184,0.9);">Lista clientes com certificados emitidos no ano escolhido.</span>
+            </label>
+            <label style="display:flex;flex-direction:column;gap:8px;font-size:0.85rem;color:var(--muted);">
                 Mês do aniversário
                 <select name="birthday_month" style="padding:12px;border-radius:12px;border:1px solid var(--border);background:rgba(15,23,42,0.58);color:var(--text);">
                     <option value="0" <?= $selectedBirthdayMonth === 0 ? 'selected' : ''; ?>>Todos os meses</option>
@@ -550,7 +573,8 @@ document.addEventListener('DOMContentLoaded', function () {
                     || (int)($filters['expiration_month'] ?? 0) > 0
                     || ($filters['expiration_scope'] ?? 'current') === 'all'
                     || ($filters['document_type'] ?? '') !== ''
-                    || (int)($filters['birthday_month'] ?? 0) > 0;
+                        || (int)($filters['birthday_month'] ?? 0) > 0
+                        || (int)($filters['issue_year'] ?? 0) > 0;
             ?>
             <?php if ($hasFilters): ?>
                 <a href="<?= $baseUrl; ?>" style="color:var(--muted);text-decoration:none;">Limpar</a>
@@ -570,7 +594,15 @@ document.addEventListener('DOMContentLoaded', function () {
             <strong style="font-size:1rem;">Resultados filtrados</strong>
             <span style="font-size:0.85rem;color:var(--muted);">Mostrando <?= $resultCount; ?> de <?= $resultTotal; ?> clientes que correspondem aos filtros.</span>
         </div>
-        <span style="display:inline-flex;align-items:center;justify-content:center;padding:10px 14px;border-radius:999px;background:rgba(56,189,248,0.22);color:var(--accent);font-weight:600;font-size:0.9rem;">Total atual: <?= $resultTotal; ?></span>
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;justify-content:flex-end;">
+            <span style="display:inline-flex;align-items:center;justify-content:center;padding:10px 14px;border-radius:999px;background:rgba(56,189,248,0.22);color:var(--accent);font-weight:600;font-size:0.9rem;">Total atual: <?= $resultTotal; ?></span>
+            <span style="display:inline-flex;align-items:center;justify-content:center;padding:10px 14px;border-radius:999px;background:rgba(148,163,184,0.18);color:var(--text);font-weight:600;font-size:0.9rem;gap:6px;">
+                <span style="color:rgba(148,163,184,0.9);font-weight:600;">Docs:</span>
+                <span><?= $documentCounts['cnpj']; ?> CNPJ</span>
+                <span aria-hidden="true" style="color:rgba(148,163,184,0.6);">•</span>
+                <span><?= $documentCounts['cpf']; ?> CPF</span>
+            </span>
+        </div>
     </div>
         <?php if ($clientMarkTypes !== []): ?>
             <div class="panel" style="margin-top:16px;margin-bottom:16px;padding:18px 20px;border:1px dashed rgba(148,163,184,0.3);background:rgba(15,23,42,0.45);">

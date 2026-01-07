@@ -10,10 +10,22 @@ use App\Repositories\ChatMessageRepository;
 use App\Repositories\ChatThreadRepository;
 use App\Repositories\SettingRepository;
 use App\Repositories\UserRepository;
+use Symfony\Component\HttpFoundation\File\UploadedFile;
 
 final class ChatService
 {
     private const MAX_MESSAGE_LENGTH = 4000;
+    private const ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024; // 10 MB
+    private const ALLOWED_IMAGE_MIMES = ['image/jpeg', 'image/png', 'image/webp'];
+    private const ALLOWED_AUDIO_MIMES = ['audio/webm', 'audio/ogg', 'audio/mpeg', 'audio/mp3'];
+    private const ALLOWED_FILE_MIMES = [
+        'application/pdf',
+        'application/msword',
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        'application/vnd.ms-excel',
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'text/plain',
+    ];
 
 
     /**
@@ -174,7 +186,9 @@ final class ChatService
             return null;
         }
 
-        return $this->messages->listForThread($threadId, $limit, $beforeId, $afterId);
+        $messages = $this->messages->listForThread($threadId, $limit, $beforeId, $afterId);
+
+        return array_map(fn(array $message): array => $this->decorateMessage($message), $messages);
     }
 
     /**
@@ -277,15 +291,17 @@ final class ChatService
     /**
      * @return array{message?: array<string, mixed>, errors?: array<string, string>}
      */
-    public function sendMessage(int $threadId, string $rawBody, AuthenticatedUser $actor): array
+    public function sendMessage(int $threadId, string $rawBody, AuthenticatedUser $actor, ?UploadedFile $attachment = null): array
     {
         if (!$this->canUseInternalChat($actor)) {
             return ['errors' => ['thread' => 'Seu usuário não está liberado para o chat interno.']];
         }
 
         $trimmed = trim($rawBody);
-        if ($trimmed === '') {
-            return ['errors' => ['body' => 'Digite uma mensagem.']];
+        $hasAttachment = $attachment instanceof UploadedFile && $attachment->isValid();
+
+        if (!$hasAttachment && $trimmed === '') {
+            return ['errors' => ['body' => 'Digite uma mensagem ou envie um arquivo.']];
         }
 
         $thread = $this->threads->find($threadId);
@@ -308,17 +324,49 @@ final class ChatService
 
         $this->autoClaimLeadOnFirstReply($thread, $actor);
 
-        $body = mb_substr($trimmed, 0, self::MAX_MESSAGE_LENGTH, 'UTF-8');
+        $attachmentPayload = null;
+        $messageType = 'text';
+        $body = $trimmed;
+
+        if ($hasAttachment) {
+            $attachmentPayload = $this->processAttachment($attachment);
+            if (isset($attachmentPayload['errors'])) {
+                return ['errors' => $attachmentPayload['errors']];
+            }
+            $messageType = (string)($attachmentPayload['type'] ?? 'file');
+
+            if ($body === '') {
+                $body = match ($messageType) {
+                    'image' => 'Imagem enviada',
+                    'audio' => 'Áudio enviado',
+                    default => 'Arquivo enviado' . (isset($attachmentPayload['name']) ? ': ' . $attachmentPayload['name'] : ''),
+                };
+            }
+        }
+
+        $body = mb_substr($body, 0, self::MAX_MESSAGE_LENGTH, 'UTF-8');
+
+        $meta = $attachmentPayload['meta'] ?? null;
+        $metaJson = null;
+        if (is_array($meta)) {
+            $metaJson = json_encode($meta, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+        }
 
         $messageId = $this->messages->create([
             'thread_id' => $threadId,
             'author_id' => $actor->id,
             'body' => $body,
+            'type' => $messageType,
             'external_author' => null,
+            'attachment_path' => $attachmentPayload['path'] ?? null,
+            'attachment_name' => $attachmentPayload['name'] ?? null,
+            'attachment_mime' => $attachmentPayload['mime'] ?? null,
+            'attachment_size' => $attachmentPayload['size'] ?? null,
+            'attachment_meta' => $metaJson,
             'is_system' => 0,
         ]);
 
-        $message = $this->messages->find($messageId);
+        $message = $this->decorateMessage($this->messages->find($messageId) ?? []);
         $timestamp = $message['created_at'] ?? now();
         $this->threads->touchLastMessage($threadId, $messageId, $timestamp);
         $this->threads->markAsRead($threadId, $actor->id, $messageId, $timestamp);
@@ -412,6 +460,126 @@ final class ChatService
         }
 
         return $preview;
+    }
+
+    /**
+     * @param array<string, mixed> $message
+     * @return array<string, mixed>
+     */
+    private function decorateMessage(array $message): array
+    {
+        $message['type'] = isset($message['type']) ? strtolower((string)$message['type']) : 'text';
+
+        if (!empty($message['attachment_path'])) {
+            $path = (string)$message['attachment_path'];
+            $message['attachment_url'] = str_starts_with($path, 'http') ? $path : url($path);
+        } else {
+            $message['attachment_url'] = null;
+        }
+
+        return $message;
+    }
+
+    /**
+     * @return array{path: string, name: string, mime: string, size: int, type: string, meta: array<string, mixed>|null}|array{errors: array<string, string>}
+     */
+    private function processAttachment(UploadedFile $file): array
+    {
+        if (!$file->isValid()) {
+            return ['errors' => ['attachment' => 'Arquivo inválido.']];
+        }
+
+        $size = (int)$file->getSize();
+        if ($size <= 0 || $size > self::ATTACHMENT_MAX_BYTES) {
+            return ['errors' => ['attachment' => 'Arquivo excede o tamanho máximo permitido.']];
+        }
+
+        $mime = (string)$file->getClientMimeType();
+        $type = $this->resolveAttachmentType($mime);
+        if ($type === null) {
+            return ['errors' => ['attachment' => 'Formato de arquivo não suportado.']];
+        }
+
+        $extension = strtolower((string)$file->getClientOriginalExtension());
+        if ($extension === '') {
+            $extension = $this->guessExtensionFromMime($mime);
+        }
+        if ($extension === '') {
+            $extension = 'bin';
+        }
+
+        $relativeDir = 'uploads/chat/' . date('Y/m/d');
+        $targetDir = public_path($relativeDir);
+        if (!is_dir($targetDir)) {
+            mkdir($targetDir, 0775, true);
+        }
+
+        $filename = $this->generateSafeFilename($type, $extension);
+        $relativePath = $relativeDir . '/' . $filename;
+
+        try {
+            $file->move($targetDir, $filename);
+        } catch (\Throwable $exception) {
+            return ['errors' => ['attachment' => 'Não foi possível salvar o arquivo.']];
+        }
+
+        return [
+            'path' => $relativePath,
+            'name' => (string)$file->getClientOriginalName(),
+            'mime' => $mime,
+            'size' => $size,
+            'type' => $type,
+            'meta' => null,
+        ];
+    }
+
+    private function resolveAttachmentType(string $mime): ?string
+    {
+        $mime = strtolower(trim($mime));
+
+        if (in_array($mime, self::ALLOWED_IMAGE_MIMES, true)) {
+            return 'image';
+        }
+
+        if (in_array($mime, self::ALLOWED_AUDIO_MIMES, true) || str_starts_with($mime, 'audio/')) {
+            return 'audio';
+        }
+
+        if (in_array($mime, self::ALLOWED_FILE_MIMES, true)) {
+            return 'file';
+        }
+
+        return null;
+    }
+
+    private function guessExtensionFromMime(string $mime): string
+    {
+        return match (strtolower($mime)) {
+            'image/jpeg' => 'jpg',
+            'image/png' => 'png',
+            'image/webp' => 'webp',
+            'audio/webm' => 'webm',
+            'audio/ogg' => 'ogg',
+            'audio/mpeg', 'audio/mp3' => 'mp3',
+            'application/pdf' => 'pdf',
+            'application/msword' => 'doc',
+            'application/vnd.openxmlformats-officedocument.wordprocessingml.document' => 'docx',
+            'application/vnd.ms-excel' => 'xls',
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' => 'xlsx',
+            'text/plain' => 'txt',
+            default => '',
+        };
+    }
+
+    private function generateSafeFilename(string $prefix, string $extension): string
+    {
+        try {
+            $random = bin2hex(random_bytes(6));
+        } catch (\Throwable $exception) {
+            $random = bin2hex((string)uniqid('', true));
+        }
+
+        return $prefix . '_' . date('Ymd_His') . '_' . $random . '.' . $extension;
     }
 
     /**

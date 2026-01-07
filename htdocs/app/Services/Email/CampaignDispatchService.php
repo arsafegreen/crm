@@ -115,12 +115,21 @@ final class CampaignDispatchService
         $rateState = $this->refreshRateState((int)$account['id']);
         $budget = $this->computeBudget($account, $rateState, $limit);
         if ($budget === 0) {
-            AlertService::push('email.dispatch', 'Limite de envio atingido', [
+            AlertService::push('email.dispatch', 'Limite de envio atingido (aguardando pr¢xima janela)', [
                 'campaign_id' => (int)$campaign['id'],
                 'batch_id' => $batchId,
                 'account_id' => (int)$account['id'],
             ]);
-            throw new RuntimeException('Limite de envio atingido para a conta selecionada.');
+
+            $remaining = $this->sends->countByBatch($batchId, ['statuses' => ['pending', 'retry']]);
+
+            return [
+                'batch_id' => $batchId,
+                'sent' => 0,
+                'failed' => 0,
+                'remaining' => $remaining,
+                'status' => 'throttled',
+            ];
         }
 
         if (count($pending) > $budget) {

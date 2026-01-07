@@ -53,6 +53,12 @@ $titularDocumentDigits = digits_only($titularDocument);
 $titularDocumentFormatted = $titularDocumentDigits !== '' ? format_document($titularDocumentDigits) : '';
 $titularDisplayName = $titularName !== '' ? $titularName : ($isCompanyDocument ? '' : (trim((string)($client['name'] ?? ''))));
 $titularDisplayDocument = $titularDocumentFormatted !== '' ? $titularDocumentFormatted : (!$isCompanyDocument ? $documentFormatted : '');
+$cpfDigits = '';
+if (!$isCompanyDocument && strlen($documentDigits) === 11) {
+    $cpfDigits = $documentDigits;
+} elseif (strlen($titularDocumentDigits) === 11) {
+    $cpfDigits = $titularDocumentDigits;
+}
 
 $birthdateTimestamp = isset($client['titular_birthdate']) && $client['titular_birthdate'] !== null
     ? (int)$client['titular_birthdate']
@@ -703,6 +709,8 @@ $clientMarkEndpoint = url('crm/clients/' . (int)($client['id'] ?? 0) . '/marks')
                         data-endpoint="<?= htmlspecialchars($whatsappCrmEndpoint, ENT_QUOTES, 'UTF-8'); ?>"
                         data-contact-name="<?= htmlspecialchars($whatsappContactName, ENT_QUOTES, 'UTF-8'); ?>"
                         data-contact-phone="<?= htmlspecialchars($whatsappContactPhone, ENT_QUOTES, 'UTF-8'); ?>"
+                        data-contact-cpf="<?= htmlspecialchars($cpfDigits, ENT_QUOTES, 'UTF-8'); ?>"
+                        data-initial-queue="concluidos"
                         hidden></div>
                     <div style="margin-top:14px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;">
                         <?php if ($birthdateTimestamp !== null): ?>
@@ -1277,6 +1285,45 @@ document.addEventListener('DOMContentLoaded', function () {
 </script>
 
 <script>
+// Verifica gateway alternativo a cada 1h e alerta se estiver indisponível.
+document.addEventListener('DOMContentLoaded', function () {
+    const gatewayStatusUrl = <?= json_encode(url('whatsapp/alt/gateway-status'), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE); ?>;
+    let lastWarnedAt = 0;
+    const warnCooldownMs = 10 * 60 * 1000; // evita spam de alertas
+
+    const checkGateway = async function () {
+        try {
+            const response = await fetch(gatewayStatusUrl, { credentials: 'same-origin' });
+            if (!response.ok) {
+                throw new Error('Gateway indisponível');
+            }
+            const data = await response.json().catch(() => ({}));
+            const gateway = (data && data.gateway) ? data.gateway : {};
+            const ok = Boolean(gateway.ready || gateway.ok || gateway.hasClient);
+            if (!ok) {
+                maybeWarn();
+            }
+        } catch (error) {
+            maybeWarn();
+        }
+    };
+
+    const maybeWarn = function () {
+        const now = Date.now();
+        if (now - lastWarnedAt < warnCooldownMs) {
+            return;
+        }
+        lastWarnedAt = now;
+        alert('Gateway alternativo de WhatsApp indisponível. Verifique a conexão/QR e reinicie o gateway se necessário.');
+    };
+
+    // Checa já na entrada e depois a cada 1 hora.
+    checkGateway();
+    setInterval(checkGateway, 60 * 60 * 1000);
+});
+</script>
+
+<script>
 document.addEventListener('DOMContentLoaded', function () {
     const setupExtraPhones = function (root) {
         if (!root) {
@@ -1419,19 +1466,48 @@ document.addEventListener('DOMContentLoaded', function () {
     const endpoint = whatsappConfig.getAttribute('data-endpoint') || '';
     const contactName = whatsappConfig.getAttribute('data-contact-name') || 'Cliente';
     const contactPhone = whatsappConfig.getAttribute('data-contact-phone') || '';
+    const contactCpf = whatsappConfig.getAttribute('data-contact-cpf') || '';
+    const initialQueue = whatsappConfig.getAttribute('data-initial-queue') || '';
 
-    if (!endpoint || contactPhone === '') {
+    if (contactPhone === '') {
         return;
     }
 
     let isSending = false;
-    let lockUntil = 0;
+    const lastSentByPhone = new Map();
+
+    const buildWhatsappFallback = function (message) {
+        const digits = (contactPhone || '').replace(/\D+/g, '');
+        if (!digits) {
+            return null;
+        }
+        const phoneParam = digits.startsWith('55') ? digits : '55' + digits;
+        const params = new URLSearchParams();
+        params.set('phone', phoneParam);
+        params.set('text', message || '');
+        params.set('type', 'phone_number');
+        params.set('app_absent', '0');
+        return 'https://api.whatsapp.com/send/?' + params.toString();
+    };
 
     const sendWhatsappThread = async function (message, kind) {
+        if (!endpoint) {
+            throw new Error('Canal do CRM indisponível.');
+        }
+
         const payload = new URLSearchParams();
         payload.set('contact_name', contactName);
         payload.set('contact_phone', contactPhone);
         payload.set('message', message);
+        if (initialQueue) {
+            payload.set('initial_queue', initialQueue);
+        }
+        if (kind) {
+            payload.set('campaign_kind', kind);
+        }
+        if (kind === 'birthday' && contactCpf) {
+            payload.set('campaign_token', contactCpf);
+        }
         if (window.CSRF_TOKEN) {
             payload.set('_token', window.CSRF_TOKEN);
         }
@@ -1451,11 +1527,12 @@ document.addEventListener('DOMContentLoaded', function () {
             credentials: 'same-origin',
         });
 
-        if (!response.ok) {
-            throw new Error('Não foi possível iniciar a conversa pelo CRM.');
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok || (data && data.error)) {
+            throw new Error((data && data.error) || 'Não foi possível iniciar a conversa pelo CRM.');
         }
 
-        return response.json().catch(() => ({}));
+        return data;
     };
 
     document.addEventListener('click', async function (event) {
@@ -1469,9 +1546,13 @@ document.addEventListener('DOMContentLoaded', function () {
             return;
         }
 
-        const lastSentAt = Number(trigger.getAttribute('data-last-whatsapp-send') || '0');
         const now = Date.now();
-        if (now < lockUntil || now - lastSentAt < 2000) {
+        const phoneKey = (contactPhone || '').replace(/\D+/g, '') || 'default';
+        const lastSentAt = Number(lastSentByPhone.get(phoneKey) || 0);
+        if (now - lastSentAt < 600000) {
+            const remainingMs = 600000 - (now - lastSentAt);
+            const remainingMinutes = Math.max(1, Math.ceil(remainingMs / 60000));
+            alert(`Já foi enviada uma mensagem para este número há menos de 10 minutos. Tente novamente em ${remainingMinutes} min.`);
             return;
         }
 
@@ -1482,19 +1563,20 @@ document.addEventListener('DOMContentLoaded', function () {
 
         isSending = true;
         trigger.setAttribute('aria-busy', 'true');
-        trigger.setAttribute('data-last-whatsapp-send', String(now));
+        lastSentByPhone.set(phoneKey, now);
         if (typeof trigger.disabled !== 'undefined') {
             trigger.disabled = true;
         }
-        lockUntil = now + 60000; // 1 minuto de bloqueio
-        setTimeout(function () {
-            lockUntil = 0;
-        }, 60000);
 
         try {
             await sendWhatsappThread(message, trigger.getAttribute('data-whatsapp-kind') || '');
         } catch (error) {
-            alert(error.message || 'Falha ao abrir a conversa.');
+            const fallbackUrl = buildWhatsappFallback(message);
+            if (fallbackUrl) {
+                window.open(fallbackUrl, '_blank');
+            } else {
+                alert(error.message || 'Falha ao abrir a conversa.');
+            }
         } finally {
             isSending = false;
             trigger.removeAttribute('aria-busy');

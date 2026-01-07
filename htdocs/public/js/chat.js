@@ -21,6 +21,12 @@
     var emojiToggle = chatRoot.querySelector('[data-emoji-toggle]');
     var emojiPanel = chatRoot.querySelector('[data-emoji-panel]');
     var emojiButtons = document.querySelectorAll('[data-emoji-button]');
+    var attachmentInput = composeForm ? composeForm.querySelector('[data-chat-attachment-input]') : null;
+    var attachmentChip = composeForm ? composeForm.querySelector('[data-attachment-chip]') : null;
+    var attachmentNameEl = composeForm ? composeForm.querySelector('[data-attachment-name]') : null;
+    var attachmentSizeEl = composeForm ? composeForm.querySelector('[data-attachment-size]') : null;
+    var attachmentClear = composeForm ? composeForm.querySelector('[data-clear-attachment]') : null;
+    var attachmentTrigger = composeForm ? composeForm.querySelector('[data-attach-trigger]') : null;
     var toastContainer = document.querySelector('[data-chat-toast-container]');
     var externalStatusWrapper = chatRoot.querySelector('[data-thread-external-wrapper]');
     var externalStatusLabelEl = chatRoot.querySelector('[data-thread-external-label]');
@@ -241,6 +247,34 @@
             }
             var body = escapeHtml(message.body || '');
             var timestamp = formatTime(message.created_at);
+            var type = (message.type || 'text').toLowerCase();
+            var attachmentUrl = message.attachment_url || '';
+            var attachmentName = message.attachment_name || '';
+            var attachmentSize = parseInt(message.attachment_size || 0, 10) || 0;
+            var attachmentHtml = '';
+            if (attachmentUrl) {
+                var metaParts = [];
+                if (attachmentName) {
+                    metaParts.push('<span>' + escapeHtml(attachmentName) + '</span>');
+                }
+                var sizeLabel = formatBytes(attachmentSize);
+                if (sizeLabel) {
+                    metaParts.push('<small>' + escapeHtml(sizeLabel) + '</small>');
+                }
+                var preview = '';
+                if (type === 'image') {
+                    preview = '<img src="' + escapeHtml(attachmentUrl) + '" alt="' + escapeHtml(attachmentName || 'Imagem') + '">';
+                } else if (type === 'audio') {
+                    preview = '<audio controls src="' + escapeHtml(attachmentUrl) + '" preload="none"></audio>';
+                } else {
+                    preview = '<a href="' + escapeHtml(attachmentUrl) + '" target="_blank" rel="noopener">' + escapeHtml(attachmentName || 'Arquivo') + '</a>';
+                }
+                attachmentHtml = '<div class="chat-attachment chat-attachment--' + escapeHtml(type) + '">' + preview;
+                if (metaParts.length > 0) {
+                    attachmentHtml += '<div class="chat-attachment-meta">' + metaParts.join('') + '</div>';
+                }
+                attachmentHtml += '</div>';
+            }
             var classes = 'chat-message';
             if (mine) {
                 classes += ' is-mine';
@@ -251,7 +285,7 @@
             if (hasExternalAuthor) {
                 classes += ' is-visitor';
             }
-            return '<article class="' + classes + '" data-message-id="' + message.id + '"><header><strong>' + escapeHtml(author) + '</strong><span>' + escapeHtml(timestamp) + '</span></header><p>' + body.replace(/\n/g, '<br>') + '</p></article>';
+            return '<article class="' + classes + '" data-message-id="' + message.id + '"><header><strong>' + escapeHtml(author) + '</strong><span>' + escapeHtml(timestamp) + '</span></header><p>' + body.replace(/\n/g, '<br>') + '</p>' + attachmentHtml + '</article>';
         });
 
         if (append) {
@@ -497,6 +531,12 @@
             alert('Esta conversa foi finalizada.');
             return;
         }
+        var hasAttachment = attachmentInput && attachmentInput.files && attachmentInput.files.length > 0;
+        var messageValue = messageInput ? messageInput.value : '';
+        if (!hasAttachment && (!messageValue || messageValue.trim() === '')) {
+            alert('Digite uma mensagem ou escolha um arquivo.');
+            return;
+        }
         var formData = new FormData(composeForm);
         var url = composeForm.getAttribute('action');
         api(url, {
@@ -504,6 +544,7 @@
             body: formData
         }).then(function (payload) {
             composeForm.reset();
+            clearAttachment();
             closeEmojiPanel();
             if (payload && payload.message) {
                 var after = lastMessageId > 0 ? lastMessageId : null;
@@ -715,6 +756,39 @@
         closeEmojiPanel();
     }
 
+    function clearAttachment() {
+        if (attachmentInput) {
+            attachmentInput.value = '';
+        }
+        if (attachmentNameEl) {
+            attachmentNameEl.textContent = '';
+        }
+        if (attachmentSizeEl) {
+            attachmentSizeEl.textContent = '';
+        }
+        if (attachmentChip) {
+            attachmentChip.hidden = true;
+        }
+    }
+
+    function updateAttachmentChip() {
+        if (!attachmentInput || !attachmentChip) {
+            return;
+        }
+        var file = attachmentInput.files && attachmentInput.files[0];
+        if (!file) {
+            clearAttachment();
+            return;
+        }
+        if (attachmentNameEl) {
+            attachmentNameEl.textContent = file.name || 'Arquivo';
+        }
+        if (attachmentSizeEl) {
+            attachmentSizeEl.textContent = formatBytes(file.size) || '';
+        }
+        attachmentChip.hidden = false;
+    }
+
     function extractErrorMessage(payload) {
         if (!payload) {
             return null;
@@ -857,6 +931,21 @@
         });
     }
 
+    function formatBytes(bytes) {
+        var size = parseInt(bytes || 0, 10) || 0;
+        if (size <= 0) {
+            return '';
+        }
+        var units = ['B', 'KB', 'MB', 'GB'];
+        var unitIndex = 0;
+        while (size >= 1024 && unitIndex < units.length - 1) {
+            size = size / 1024;
+            unitIndex++;
+        }
+        var decimals = unitIndex === 0 ? 0 : (unitIndex >= 2 ? 2 : 1);
+        return size.toFixed(decimals).replace('.', ',') + ' ' + units[unitIndex];
+    }
+
     function formatTime(timestamp) {
         if (!timestamp) {
             return '';
@@ -869,6 +958,36 @@
 
     if (composeForm) {
         composeForm.addEventListener('submit', submitMessage);
+    }
+
+    if (messageInput && composeForm) {
+        messageInput.addEventListener('keydown', function (event) {
+            if (event.key !== 'Enter' || event.shiftKey) {
+                return;
+            }
+            var value = messageInput.value || '';
+            if (value.trim() === '') {
+                return;
+            }
+            event.preventDefault();
+            composeForm.requestSubmit();
+        });
+    }
+
+    if (attachmentInput) {
+        attachmentInput.addEventListener('change', updateAttachmentChip);
+    }
+    if (attachmentClear) {
+        attachmentClear.addEventListener('click', function () {
+            clearAttachment();
+        });
+    }
+    if (attachmentTrigger) {
+        attachmentTrigger.addEventListener('click', function () {
+            if (attachmentInput) {
+                attachmentInput.click();
+            }
+        });
     }
 
     if (refreshButton) {

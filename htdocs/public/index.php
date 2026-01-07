@@ -5,6 +5,19 @@ declare(strict_types=1);
 use App\Kernel;
 use Symfony\Component\HttpFoundation\Response;
 
+$customLog = realpath(__DIR__ . '/../../php/logs/php_error_log');
+if ($customLog !== false) {
+    ini_set('error_log', $customLog);
+}
+ini_set('log_errors', '1');
+error_reporting(E_ALL);
+register_shutdown_function(static function (): void {
+    $err = error_get_last();
+    if ($err !== null) {
+        error_log(sprintf('[fatal] %s in %s on line %d', $err['message'], $err['file'], $err['line']));
+    }
+});
+
 $request = require __DIR__ . '/../bootstrap/app.php';
 
 $forceHttps = config('app.force_https', false);
@@ -28,6 +41,10 @@ try {
     $response = $kernel->handle($request);
 } catch (Throwable $exception) {
     $status = config('app.debug') ? 500 : 503;
+
+    // Log any unhandled exception reaching the front controller
+    error_log('[front] ' . $exception->getMessage() . ' @ ' . $exception->getFile() . ':' . $exception->getLine());
+    error_log($exception->getTraceAsString());
 
     if (config('app.debug')) {
         $body = sprintf(

@@ -69,6 +69,72 @@ final class WhatsappMessageRepository
         return count($ids);
     }
 
+    /**
+     * Arquiva mensagens com mais de $days days e remove do primário.
+     */
+    public function archiveOlderThanDays(int $days = 60, int $batch = 500): int
+    {
+        $days = max(1, $days);
+        $cutoff = time() - ($days * 86400);
+
+        $this->ensureArchiveTable();
+
+        $stmt = $this->pdo->prepare(
+            'SELECT id FROM whatsapp_messages WHERE sent_at < :cutoff ORDER BY sent_at ASC LIMIT :limit'
+        );
+        $stmt->bindValue(':cutoff', $cutoff, PDO::PARAM_INT);
+        $stmt->bindValue(':limit', max(1, $batch), PDO::PARAM_INT);
+        $stmt->execute();
+        $ids = $stmt->fetchAll(PDO::FETCH_COLUMN);
+        if ($ids === false || $ids === []) {
+            return 0;
+        }
+
+        $idPlaceholders = implode(', ', array_fill(0, count($ids), '?'));
+
+        $archiveSql = 'INSERT INTO whatsapp_messages_archive (orig_id, thread_id, direction, message_type, content, ai_summary, suggestion_source, meta_message_id, status, sent_at, created_at, metadata, archived_at)
+                       SELECT id, thread_id, direction, message_type, content, ai_summary, suggestion_source, meta_message_id, status, sent_at, created_at, metadata, strftime("%s", "now")
+                       FROM whatsapp_messages WHERE id IN (' . $idPlaceholders . ')';
+        $archiveStmt = $this->pdo->prepare($archiveSql);
+        foreach ($ids as $i => $id) {
+            $archiveStmt->bindValue($i + 1, (int)$id, PDO::PARAM_INT);
+        }
+
+        $this->pdo->beginTransaction();
+        try {
+            $archiveStmt->execute();
+
+            $deleteStmt = $this->pdo->prepare('DELETE FROM whatsapp_messages WHERE id IN (' . $idPlaceholders . ')');
+            foreach ($ids as $i => $id) {
+                $deleteStmt->bindValue($i + 1, (int)$id, PDO::PARAM_INT);
+            }
+            $deleteStmt->execute();
+
+            $this->pdo->commit();
+        } catch (PDOException $exception) {
+            $this->pdo->rollBack();
+            throw $exception;
+        }
+
+        return count($ids);
+    }
+
+    /**
+     * Remove arquivos de histórico com mais de $years anos.
+     */
+    public function purgeArchiveOlderThanYears(int $years = 2): int
+    {
+        $years = max(1, $years);
+        $cutoff = time() - (int)($years * 365.25 * 86400);
+
+        $this->ensureArchiveTable();
+        $stmt = $this->pdo->prepare('DELETE FROM whatsapp_messages_archive WHERE sent_at < :cutoff');
+        $stmt->bindValue(':cutoff', $cutoff, PDO::PARAM_INT);
+        $stmt->execute();
+
+        return $stmt->rowCount();
+    }
+
     private function ensureArchiveTable(): void
     {
         $this->pdo->exec(
@@ -276,6 +342,11 @@ final class WhatsappMessageRepository
             $params[':content'] = (string)$payload['content'];
         }
 
+        if (array_key_exists('meta_message_id', $payload)) {
+            $fields[] = 'meta_message_id = :meta_message_id';
+            $params[':meta_message_id'] = $payload['meta_message_id'];
+        }
+
         if (array_key_exists('message_type', $payload)) {
             $fields[] = 'message_type = :message_type';
             $params[':message_type'] = (string)$payload['message_type'];
@@ -305,6 +376,65 @@ final class WhatsappMessageRepository
         $stmt->execute($params);
     }
 
+    public function findIncomingDuplicate(
+        int $threadId,
+        string $content,
+        int $timestamp,
+        string $messageType = 'text',
+        ?string $metaMessageId = null,
+        int $windowSeconds = 180
+    ): ?array {
+        $threadId = max(0, $threadId);
+        if ($threadId === 0) {
+            return null;
+        }
+
+        $content = trim($content);
+        $messageType = trim($messageType) !== '' ? trim($messageType) : 'text';
+        $start = max(0, $timestamp - max(1, $windowSeconds));
+        $end = $timestamp + max(1, $windowSeconds);
+
+        $conditions = ['thread_id = :thread', 'direction = "incoming"'];
+        $clauses = [];
+        $params = [
+            ':thread' => $threadId,
+            ':type' => $messageType,
+            ':start' => $start,
+            ':end' => $end,
+        ];
+
+        if ($metaMessageId !== null && trim($metaMessageId) !== '') {
+            $clauses[] = 'meta_message_id = :meta';
+            $params[':meta'] = trim($metaMessageId);
+        }
+
+        if ($content !== '') {
+            $clauses[] = '(content = :content AND message_type = :type AND sent_at BETWEEN :start AND :end)';
+            $params[':content'] = $content;
+        }
+
+        if ($clauses === []) {
+            return null;
+        }
+
+        $sql = 'SELECT * FROM whatsapp_messages WHERE ' . implode(' AND ', $conditions)
+             . ' AND (' . implode(' OR ', $clauses) . ') ORDER BY id DESC LIMIT 1';
+
+        $stmt = $this->pdo->prepare($sql);
+        foreach ($params as $key => $value) {
+            if (in_array($key, [':thread', ':start', ':end'], true)) {
+                $stmt->bindValue($key, (int)$value, PDO::PARAM_INT);
+                continue;
+            }
+            $stmt->bindValue($key, $value);
+        }
+
+        $stmt->execute();
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+
+        return $row !== false ? $row : null;
+    }
+
     public function countOutgoingAltByPhoneSince(string $phone, int $sinceTimestamp): int
     {
         $normalized = preg_replace('/\D+/', '', trim($phone)) ?? '';
@@ -325,6 +455,57 @@ final class WhatsappMessageRepository
         $stmt = $this->pdo->prepare($sql);
         $stmt->bindValue(':since', $sinceTimestamp, PDO::PARAM_INT);
         $stmt->bindValue(':phone', $normalized);
+        $stmt->execute();
+
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        return (int)($row['total'] ?? 0);
+    }
+
+    public function countOutgoingByAltGatewaySince(string $gatewaySlug, int $sinceTimestamp): int
+    {
+        $slug = preg_replace('/[^a-zA-Z0-9_-]/', '', trim($gatewaySlug)) ?? '';
+        if ($slug === '' || $sinceTimestamp <= 0) {
+            return 0;
+        }
+
+        $prefix = 'alt:' . $slug . ':%';
+        $sql =
+            'SELECT COUNT(*) AS total
+             FROM whatsapp_messages m
+             INNER JOIN whatsapp_threads t ON t.id = m.thread_id
+             WHERE m.direction = "outgoing"
+               AND m.sent_at >= :since
+               AND t.channel_thread_id LIKE :prefix';
+
+        $stmt = $this->pdo->prepare($sql);
+        $stmt->bindValue(':since', $sinceTimestamp, PDO::PARAM_INT);
+        $stmt->bindValue(':prefix', $prefix);
+        $stmt->execute();
+
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        return (int)($row['total'] ?? 0);
+    }
+
+    public function countOutgoingByCampaignSince(string $campaignKey, int $sinceTimestamp): int
+    {
+        $key = trim($campaignKey);
+        if ($key === '' || $sinceTimestamp <= 0) {
+            return 0;
+        }
+
+        // Busca em threads alt e metadata contendo a chave de campanha (como JSON simples).
+        $sql =
+            'SELECT COUNT(*) AS total
+             FROM whatsapp_messages m
+             INNER JOIN whatsapp_threads t ON t.id = m.thread_id
+             WHERE m.direction = "outgoing"
+               AND m.sent_at >= :since
+               AND t.channel_thread_id LIKE "alt:%"
+               AND m.metadata LIKE :needle';
+
+        $stmt = $this->pdo->prepare($sql);
+        $stmt->bindValue(':since', $sinceTimestamp, PDO::PARAM_INT);
+        $stmt->bindValue(':needle', '%"campaign_key":"' . $key . '"%');
         $stmt->execute();
 
         $row = $stmt->fetch(PDO::FETCH_ASSOC);

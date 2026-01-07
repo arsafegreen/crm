@@ -8,6 +8,7 @@ use App\Auth\AuthenticatedUser;
 use App\Auth\PasswordPolicy;
 use App\Auth\SessionAuthService;
 use App\Repositories\UserRepository;
+use Symfony\Component\HttpFoundation\File\UploadedFile;
 use Symfony\Component\HttpFoundation\RedirectResponse;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Response;
@@ -145,6 +146,122 @@ final class ProfileController
         return new RedirectResponse(url('profile'));
     }
 
+    public function uploadPhoto(Request $request): Response
+    {
+        $user = $this->currentUser($request);
+        if ($user === null) {
+            return new RedirectResponse(url('auth/login'));
+        }
+
+        $file = $request->files->get('photo');
+        if (!$file instanceof UploadedFile || !$file->isValid()) {
+            $_SESSION['profile_media_feedback'] = ['type' => 'error', 'message' => 'Envie uma foto válida.'];
+            return new RedirectResponse(url('profile'));
+        }
+
+        $allowedMime = ['image/jpeg', 'image/png', 'image/webp'];
+        $mime = (string)$file->getClientMimeType();
+        if (!in_array($mime, $allowedMime, true)) {
+            $_SESSION['profile_media_feedback'] = ['type' => 'error', 'message' => 'Formato da foto não suportado. Use JPG, PNG ou WEBP.'];
+            return new RedirectResponse(url('profile'));
+        }
+
+        $size = (int)$file->getSize();
+        if ($size <= 0 || $size > 2 * 1024 * 1024) {
+            $_SESSION['profile_media_feedback'] = ['type' => 'error', 'message' => 'A foto deve ter até 2MB.'];
+            return new RedirectResponse(url('profile'));
+        }
+
+        $targetDir = storage_path('uploads/profile/' . $user->id);
+        if (!is_dir($targetDir)) {
+            mkdir($targetDir, 0775, true);
+        }
+
+        $extension = strtolower((string)$file->getClientOriginalExtension());
+        if ($extension === '') {
+            $extension = 'bin';
+        }
+
+        $filename = $this->generateSafeFilename('photo', $extension);
+        $file->move($targetDir, $filename);
+
+        $state = $this->readMediaState();
+        $state[$user->id]['photo'] = [
+            'path' => 'uploads/profile/' . $user->id . '/' . $filename,
+            'updated_at' => date('c'),
+        ];
+
+        if (!$this->writeMediaState($state)) {
+            $_SESSION['profile_media_feedback'] = ['type' => 'error', 'message' => 'Erro ao salvar metadados da foto.'];
+            return new RedirectResponse(url('profile'));
+        }
+
+        $_SESSION['profile_media_feedback'] = ['type' => 'success', 'message' => 'Foto atualizada com sucesso.'];
+
+        return new RedirectResponse(url('profile'));
+    }
+
+    public function uploadCnpjVideo(Request $request): Response
+    {
+        $user = $this->currentUser($request);
+        if ($user === null) {
+            return new RedirectResponse(url('auth/login'));
+        }
+
+        $cnpj = digits_only((string)$request->request->get('cnpj', ''));
+        if (strlen($cnpj) !== 14) {
+            $_SESSION['profile_media_feedback'] = ['type' => 'error', 'message' => 'CNPJ inválido.'];
+            return new RedirectResponse(url('profile'));
+        }
+
+        $file = $request->files->get('video');
+        if (!$file instanceof UploadedFile || !$file->isValid()) {
+            $_SESSION['profile_media_feedback'] = ['type' => 'error', 'message' => 'Envie um vídeo válido.'];
+            return new RedirectResponse(url('profile'));
+        }
+
+        $allowedMime = ['video/mp4', 'video/webm', 'video/quicktime'];
+        $mime = (string)$file->getClientMimeType();
+        if (!in_array($mime, $allowedMime, true)) {
+            $_SESSION['profile_media_feedback'] = ['type' => 'error', 'message' => 'Formato do vídeo não suportado. Use MP4, WEBM ou MOV.'];
+            return new RedirectResponse(url('profile'));
+        }
+
+        $size = (int)$file->getSize();
+        if ($size <= 0 || $size > 50 * 1024 * 1024) {
+            $_SESSION['profile_media_feedback'] = ['type' => 'error', 'message' => 'O vídeo deve ter até 50MB (máx. ~1 min).'];
+            return new RedirectResponse(url('profile'));
+        }
+
+        $targetDir = storage_path('uploads/profile/' . $user->id . '/cnpj-' . $cnpj);
+        if (!is_dir($targetDir)) {
+            mkdir($targetDir, 0775, true);
+        }
+
+        $extension = strtolower((string)$file->getClientOriginalExtension());
+        if ($extension === '') {
+            $extension = 'mp4';
+        }
+
+        $filename = $this->generateSafeFilename('video', $extension);
+        $file->move($targetDir, $filename);
+
+        $state = $this->readMediaState();
+        $state[$user->id]['cnpjVideos'][$cnpj] = [
+            'path' => 'uploads/profile/' . $user->id . '/cnpj-' . $cnpj . '/' . $filename,
+            'uploaded_at' => date('c'),
+        ];
+
+        if (!$this->writeMediaState($state)) {
+            $_SESSION['profile_media_feedback'] = ['type' => 'error', 'message' => 'Erro ao salvar metadados do vídeo.'];
+            return new RedirectResponse(url('profile'));
+        }
+
+        $_SESSION['profile_media_feedback'] = ['type' => 'success', 'message' => 'Vídeo do CNPJ salvo com sucesso.'];
+
+        return new RedirectResponse(url('profile'));
+    }
+
     private function currentUser(Request $request): ?AuthenticatedUser
     {
         $user = $request->attributes->get('user');
@@ -153,5 +270,50 @@ final class ProfileController
         }
 
         return $this->auth->currentUser();
+    }
+
+    private function generateSafeFilename(string $prefix, string $extension): string
+    {
+        try {
+            $random = bin2hex(random_bytes(6));
+        } catch (\Throwable $exception) {
+            $random = bin2hex((string)uniqid('', true));
+        }
+
+        return $prefix . '_' . date('Ymd_His') . '_' . $random . '.' . $extension;
+    }
+
+    private function readMediaState(): array
+    {
+        $path = $this->mediaStatePath();
+        if (!is_file($path)) {
+            return [];
+        }
+
+        $json = (string)file_get_contents($path);
+        $data = json_decode($json, true);
+
+        return is_array($data) ? $data : [];
+    }
+
+    private function writeMediaState(array $state): bool
+    {
+        $path = $this->mediaStatePath();
+        $dir = dirname($path);
+        if (!is_dir($dir)) {
+            mkdir($dir, 0775, true);
+        }
+
+        $payload = json_encode($state, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+        if ($payload === false) {
+            return false;
+        }
+
+        return file_put_contents($path, $payload, LOCK_EX) !== false;
+    }
+
+    private function mediaStatePath(): string
+    {
+        return storage_path('profile_media.json');
     }
 }

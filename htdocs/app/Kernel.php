@@ -32,6 +32,10 @@ use App\Controllers\MarketingAutomationController;
 use App\Controllers\MarketingConsentController;
 use App\Controllers\WhatsappController;
 use App\Controllers\WhatsappAltController;
+use App\Controllers\Api\ChatbotController;
+use App\Controllers\FeedbackAdminController;
+use App\Controllers\AdminNotificationController;
+use App\Controllers\LandingController;
 use App\Security\CsrfTokenManager;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Response;
@@ -52,6 +56,8 @@ final class Kernel
             '/chat/external-thread/*/messages',
             '/whatsapp/webhook',
             '/whatsapp/alt/webhook/incoming',
+            '/api/v1/chatbot/suggest',
+            '/api/v1/chatbot/actions',
         ],
     ];
     /** @var array<string, array<string, true>> */
@@ -70,6 +76,8 @@ final class Kernel
         $this->dispatcher = cachedDispatcher(function (RouteCollector $routes): void {
             $routes->addRoute('GET', '/', [DashboardController::class, 'index']);
             $routes->addRoute('POST', '/automation/start', [AutomationController::class, 'start']);
+
+            $routes->addRoute('GET', '/landing', [LandingController::class, 'home']);
 
             $routes->addRoute('GET', '/finance', [FinanceController::class, 'overview']);
             $routes->addRoute('GET', '/finance/calendar', [FinanceController::class, 'calendar']);
@@ -107,6 +115,7 @@ final class Kernel
             $routes->addRoute('POST', '/crm/import', [CrmController::class, 'import']);
             $routes->addRoute('GET', '/crm/clients', [CrmController::class, 'clients']);
             $routes->addRoute('GET', '/crm/clients/contact-search', [CrmController::class, 'contactSearch']);
+            $routes->addRoute('GET', '/crm/clients/quick-search', [CrmController::class, 'quickClientSearch']);
             $routes->addRoute('GET', '/crm/clients/create', [CrmController::class, 'createClient']);
             $routes->addRoute('POST', '/crm/clients/check', [CrmController::class, 'checkClient']);
             $routes->addRoute('POST', '/crm/clients/lookup-titular', [CrmController::class, 'lookupTitular']);
@@ -244,6 +253,7 @@ final class Kernel
             $routes->addRoute('POST', '/marketing/automations/birthday/run', [MarketingAutomationController::class, 'run']);
             $routes->addRoute('GET', '/marketing/automations/renewal/status', [MarketingAutomationController::class, 'renewalStatus']);
             $routes->addRoute('GET', '/marketing/automations/email/options', [MarketingAutomationController::class, 'emailOptions']);
+            $routes->addRoute('GET', '/marketing/automations/email/status', [MarketingAutomationController::class, 'emailStatus']);
             $routes->addRoute('POST', '/marketing/automations/email/schedule', [MarketingAutomationController::class, 'scheduleEmail']);
             $routes->addRoute('GET', '/marketing/automations/blocking', [MarketingAutomationController::class, 'blockingStatus']);
             $routes->addRoute('POST', '/marketing/automations/blocking', [MarketingAutomationController::class, 'saveBlocking']);
@@ -313,6 +323,8 @@ final class Kernel
             $routes->addRoute('POST', '/whatsapp/alt/history-sync', [WhatsappAltController::class, 'gatewayHistorySync']);
             $routes->addRoute('POST', '/whatsapp/alt/send', [WhatsappAltController::class, 'sendViaGateway']);
             $routes->addRoute('POST', '/whatsapp/alt/webhook/incoming', [WhatsappAltController::class, 'webhook']);
+            $routes->addRoute('POST', '/api/v1/chatbot/suggest', [ChatbotController::class, 'suggest']);
+            $routes->addRoute('POST', '/api/v1/chatbot/actions', [ChatbotController::class, 'actions']);
 
             $routes->addRoute('GET', '/auth/login', [AuthController::class, 'loginForm']);
             $routes->addRoute('POST', '/auth/login', [AuthController::class, 'login']);
@@ -327,6 +339,8 @@ final class Kernel
             $routes->addRoute('GET', '/profile', [ProfileController::class, 'show']);
             $routes->addRoute('POST', '/profile/details', [ProfileController::class, 'updateDetails']);
             $routes->addRoute('POST', '/profile/password', [ProfileController::class, 'updatePassword']);
+            $routes->addRoute('POST', '/profile/photo', [ProfileController::class, 'uploadPhoto']);
+            $routes->addRoute('POST', '/profile/cnpj-video', [ProfileController::class, 'uploadCnpjVideo']);
 
             $routes->addRoute('GET', '/admin/access-requests', [AccessRequestController::class, 'index']);
             $routes->addRoute('POST', '/admin/access-requests/{id:\\d+}/approve', [AccessRequestController::class, 'approve']);
@@ -354,6 +368,10 @@ final class Kernel
             $routes->addRoute('POST', '/admin/users/{id:\d+}/delete', [AccessRequestController::class, 'delete']);
             $routes->addRoute('POST', '/admin/chat/purge', [ChatAdminController::class, 'purge']);
             $routes->addRoute('POST', '/admin/chat/policy', [ChatAdminController::class, 'updatePolicy']);
+            $routes->addRoute('GET', '/admin/feedback/reports', [FeedbackAdminController::class, 'listOpen']);
+            $routes->addRoute('POST', '/admin/feedback/reports/{id}', [FeedbackAdminController::class, 'updateStatus']);
+            $routes->addRoute('GET', '/admin/notifications/unread', [AdminNotificationController::class, 'listUnread']);
+            $routes->addRoute('POST', '/admin/notifications/mark-read', [AdminNotificationController::class, 'markRead']);
 
             // --- Bounce sweep endpoints ---
             $this->registerRoute($routes, 'POST', '/marketing/lists/sweep/start', [\App\Controllers\MarketingListSweepController::class, 'start']);

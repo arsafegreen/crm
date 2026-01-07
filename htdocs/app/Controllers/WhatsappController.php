@@ -49,13 +49,9 @@ final class WhatsappController
             return new Response($e->getMessage(), 403);
         }
 
-        $channel = (string)$request->query->get('channel', '');
-        $allowedChannels = ['meta', 'alt'];
-        if ($channel === '' || !in_array($channel, $allowedChannels, true)) {
-            $channel = null;
-        }
+        $channel = $this->normalizeChannel((string)$request->query->get('channel', ''));
 
-        // Default back to eager panel render; allow opt-in defer via query.
+        // Carrega painéis imediatamente (padrão false) para não ficar vazio no standalone.
         $deferPanels = $request->query->getBoolean('defer_panels', false);
 
         $threadId = (int)$request->query->get('thread');
@@ -63,13 +59,24 @@ final class WhatsappController
         $probeAltGateways = $request->query->getBoolean('probe_alt_gateways', false);
         $sharedData = $this->buildSharedData($user, $options, $allowed, $probeAltGateways);
 
-        $arrivalThreads = $deferPanels ? [] : $this->service->queueThreadsForUser($user, 'arrival');
-        $scheduledThreads = $deferPanels ? [] : $this->service->queueThreadsForUser($user, 'scheduled');
-        $partnerThreads = $deferPanels ? [] : $this->service->queueThreadsForUser($user, 'partner');
-        $myThreads = $deferPanels ? [] : $this->service->threadsAssignedTo($user->id);
-        $groupThreads = $deferPanels ? [] : $this->service->groupThreadsForUser($user);
-        $reminderThreads = $deferPanels ? [] : $this->service->reminderThreadsForUser($user);
-        $completedThreads = $deferPanels ? [] : $this->service->completedThreadsForUser($user);
+        $arrivalThreads = $deferPanels ? [] : $this->limitThreads($this->filterThreadsByChannel($this->service->queueThreadsForUser($user, 'arrival'), $channel));
+        $scheduledThreads = $deferPanels ? [] : $this->limitThreads($this->filterThreadsByChannel($this->service->queueThreadsForUser($user, 'scheduled'), $channel));
+        $partnerThreads = $deferPanels ? [] : $this->limitThreads($this->filterThreadsByChannel($this->service->queueThreadsForUser($user, 'partner'), $channel));
+        $myThreads = $deferPanels ? [] : $this->limitThreads($this->filterThreadsByChannel($this->service->threadsAssignedTo($user->id), $channel));
+        $groupThreads = $deferPanels ? [] : $this->limitThreads($this->filterThreadsByChannel($this->service->groupThreadsForUser($user), $channel));
+        $reminderThreads = $deferPanels ? [] : $this->limitThreads($this->filterThreadsByChannel($this->service->reminderThreadsForUser($user), $channel));
+        $completedThreads = $deferPanels ? [] : $this->limitThreads($this->filterThreadsByChannel($this->service->completedThreadsForUser($user), $channel));
+
+        if ($threadDetails !== null && !$this->threadMatchesChannel($threadDetails['thread'] ?? [], $channel)) {
+            $threadDetails = null;
+        }
+
+        $queueSummary = $this->queueSummaryForChannel($sharedData['queueSummary'] ?? [], [
+            'arrival' => $arrivalThreads,
+            'scheduled' => $scheduledThreads,
+            'partner' => $partnerThreads,
+            'reminder' => $reminderThreads,
+        ]);
 
         return view('whatsapp/index', array_merge($sharedData, [
             'arrivalThreads' => $arrivalThreads,
@@ -82,6 +89,7 @@ final class WhatsappController
             'thread' => $threadDetails,
             'selectedChannel' => $channel,
             'deferPanels' => $deferPanels,
+            'queueSummary' => $queueSummary,
         ]));
     }
 
@@ -134,6 +142,7 @@ final class WhatsappController
             'messages' => $result['messages'],
             'last_message_id' => $result['last_message_id'],
             'thread_unread' => $result['thread']['unread_count'] ?? 0,
+            'contact' => $result['contact'] ?? null,
             'queue_summary' => $this->service->queueSummary(),
         ]);
     }
@@ -148,13 +157,10 @@ final class WhatsappController
         }
 
         $standaloneView = $request->query->get('standalone') === '1';
-        $channel = (string)$request->query->get('channel', '');
-        $allowedChannels = ['meta', 'alt'];
-        if ($channel === '' || !in_array($channel, $allowedChannels, true)) {
-            $channel = null;
-        }
+        $channel = $this->normalizeChannel((string)$request->query->get('channel', ''));
 
         $compactPanels = $request->query->getBoolean('compact', false);
+        $searchTerm = trim(mb_strtolower((string)$request->query->get('search', '')));
 
         $activeThreadId = (int)$request->query->get('thread', 0);
 
@@ -192,7 +198,7 @@ final class WhatsappController
             }
         }
 
-        $panelDefinitions = $this->buildPanelDefinitions($user);
+        $panelDefinitions = $this->buildPanelDefinitions($user, $searchTerm, $channel);
         $linkBuilder = $this->buildWhatsappLinkGenerator($standaloneView, $channel);
 
         $renderContext = [
@@ -249,7 +255,7 @@ final class WhatsappController
 
             $panelsPayload[$panelKey] = [
                 'label' => $panelData['label'],
-                'count' => count($groupedThreads),
+                'count' => isset($panelData['count_override']) ? (int)$panelData['count_override'] : count($groupedThreads),
                 'unread' => $unreadTotal,
                 'html' => implode('', $htmlSegments),
                 'empty' => $panelData['empty'],
@@ -258,9 +264,16 @@ final class WhatsappController
             ];
         }
 
+        $queueSummary = $this->queueSummaryForChannel([], [
+            'arrival' => $panelDefinitions['entrada']['threads'] ?? [],
+            'scheduled' => $panelDefinitions['agendamento']['threads'] ?? [],
+            'partner' => $panelDefinitions['parceiros']['threads'] ?? [],
+            'reminder' => $panelDefinitions['lembrete']['threads'] ?? [],
+        ]);
+
         return new JsonResponse([
             'panels' => $panelsPayload,
-            'queue_summary' => $this->service->queueSummary(),
+            'queue_summary' => $queueSummary,
         ]);
     }
 
@@ -276,8 +289,8 @@ final class WhatsappController
 
         $options = $this->service->globalOptions();
         $allowed = $this->service->allowedUserIds();
-        // Config tela standalone: evita sondar gateways alternativos para acelerar carregamento
-        $sharedData = $this->buildSharedData($user, $options, $allowed, false);
+        // Config tela standalone: evita sondar gateways alternativos para acelerar carregamento (JS atualiza depois)
+        $sharedData = $this->buildSharedData($user, $options, $allowed, false, true);
 
         return view('whatsapp/config', $sharedData);
     }
@@ -438,21 +451,31 @@ HTML;
         return new JsonResponse($result);
     }
 
-    public function sendMessage(Request $request): JsonResponse
+    public function sendMessage(Request $request): Response
     {
         $user = $this->requireUser($request);
+        $expectsJson = $this->expectsJson($request);
         try {
             $this->guardAccess($user);
         } catch (RuntimeException $e) {
-            return new JsonResponse(['error' => $e->getMessage()], 403);
+            $payload = ['error' => $e->getMessage()];
+            return $expectsJson
+                ? new JsonResponse($payload, 403)
+                : $this->redirectBack($request, $payload);
         }
 
         if (!$this->service->canForward($user)) {
-            return new JsonResponse(['error' => 'Você não tem permissão para alterar o status desta conversa.'], 403);
+            $payload = ['error' => 'Você não tem permissão para alterar o status desta conversa.'];
+            return $expectsJson
+                ? new JsonResponse($payload, 403)
+                : $this->redirectBack($request, $payload);
         }
 
         if (!$this->service->canForward($user)) {
-            return new JsonResponse(['error' => 'Você não tem permissão para direcionar conversas.'], 403);
+            $payload = ['error' => 'Você não tem permissão para direcionar conversas.'];
+            return $expectsJson
+                ? new JsonResponse($payload, 403)
+                : $this->redirectBack($request, $payload);
         }
 
         $threadId = (int)$request->request->get('thread_id');
@@ -479,7 +502,10 @@ HTML;
                 'thread_id' => $threadId,
                 'user_id' => $user->id,
             ]);
-            return new JsonResponse(['error' => $e->getMessage()], 422);
+            $payload = ['error' => $e->getMessage()];
+            return $expectsJson
+                ? new JsonResponse($payload, 422)
+                : $this->redirectBack($request, $payload);
         } catch (\Throwable $e) {
             $messageText = $e->getMessage() !== '' ? $e->getMessage() : 'Erro inesperado ao enviar mensagem.';
             AlertService::push('whatsapp.send', $messageText, [
@@ -487,15 +513,22 @@ HTML;
                 'user_id' => $user->id,
                 'exception' => get_class($e),
             ]);
-            return new JsonResponse(['error' => $messageText], 500);
+            $payload = ['error' => $messageText];
+            return $expectsJson
+                ? new JsonResponse($payload, 500)
+                : $this->redirectBack($request, $payload);
         }
 
-        return new JsonResponse([
+        $payload = [
             'message_id' => $result['message_id'],
             'status' => $result['status'],
             'meta' => $result['meta'],
             'message' => $result['message'] ?? null,
-        ]);
+        ];
+
+        return $expectsJson
+            ? new JsonResponse($payload)
+            : $this->redirectBack($request, ['sent' => 1, 'thread' => $threadId]);
     }
 
     public function broadcast(Request $request): JsonResponse
@@ -578,7 +611,7 @@ HTML;
         return $response;
     }
 
-    public function startManualThread(Request $request): JsonResponse
+    public function startManualThread(Request $request): Response
     {
         $user = $this->requireUser($request);
         try {
@@ -587,24 +620,87 @@ HTML;
             return new JsonResponse(['error' => $e->getMessage()], 403);
         }
 
-        if (!$this->service->canForward($user)) {
-            return new JsonResponse(['error' => 'Você não tem permissão para redistribuir conversas.'], 403);
-        }
-
         if (!$this->service->canStartManualThread($user)) {
             return new JsonResponse(['error' => 'Você não tem permissão para iniciar novas conversas.'], 403);
+        }
+
+        $selectedChannel = $this->normalizeChannel((string)$request->request->get('channel', $request->query->get('channel', '')));
+        $gatewayInstance = (string)$request->request->get('gateway_instance', '');
+        if ($gatewayInstance === '' && $selectedChannel !== '') {
+            $config = config('whatsapp_alt_gateways', []);
+            $instances = is_array($config['instances'] ?? null) ? $config['instances'] : [];
+            $pick = static function (array $instances, string $prefix): ?string {
+                foreach ($instances as $slug => $instance) {
+                    if (!is_string($slug)) {
+                        continue;
+                    }
+                    if (str_starts_with($slug, $prefix)) {
+                        return $slug;
+                    }
+                }
+                return null;
+            };
+            if ($selectedChannel === 'alt_wpp') {
+                $gatewayInstance = $pick($instances, 'wpp') ?? $gatewayInstance;
+            } elseif ($selectedChannel === 'alt_lab') {
+                $gatewayInstance = $pick($instances, 'lab') ?? $gatewayInstance;
+            }
         }
 
         $payload = [
             'contact_name' => $request->request->get('contact_name'),
             'contact_phone' => $request->request->get('contact_phone'),
             'message' => $request->request->get('message'),
+            'initial_queue' => $request->request->get('initial_queue'),
+            'campaign_kind' => $request->request->get('campaign_kind'),
+            'campaign_token' => $request->request->get('campaign_token'),
+            'gateway_instance' => $gatewayInstance,
         ];
+
+        \App\Services\AlertService::push('whatsapp.manual_click', 'WhatsApp manual disparo solicitado.', [
+            'user_id' => $user->id,
+            'phone' => $payload['contact_phone'] ?? null,
+            'kind' => $payload['campaign_kind'] ?? null,
+            'gateway_instance' => $request->request->get('gateway_instance') ?? null,
+        ]);
 
         try {
             $result = $this->service->startManualConversation($payload, $user);
         } catch (RuntimeException $e) {
+            \App\Services\AlertService::push('whatsapp.manual_fail', 'WhatsApp manual falhou antes do envio.', [
+                'user_id' => $user->id,
+                'phone' => $payload['contact_phone'] ?? null,
+                'kind' => $payload['campaign_kind'] ?? null,
+                'error' => $e->getMessage(),
+            ]);
             return new JsonResponse(['error' => $e->getMessage()], 422);
+        }
+
+        \App\Services\AlertService::push('whatsapp.manual_success', 'WhatsApp manual enviado.', [
+            'user_id' => $user->id,
+            'phone' => $payload['contact_phone'] ?? null,
+            'kind' => $payload['campaign_kind'] ?? null,
+            'thread_id' => $result['thread_id'] ?? null,
+        ]);
+
+        $acceptHeader = strtolower((string)$request->headers->get('accept', ''));
+        $shouldRedirect = $request->request->getBoolean('redirect', false)
+            || (!$request->isXmlHttpRequest() && !str_contains($acceptHeader, 'application/json'));
+
+        if ($shouldRedirect) {
+            $params = ['thread' => $result['thread_id']];
+            $channel = $this->normalizeChannel((string)$request->request->get('channel', $request->query->get('channel', '')));
+            if ($channel !== '') {
+                $params['channel'] = $channel;
+            }
+            if ((string)$request->request->get('standalone', $request->query->get('standalone', '0')) === '1') {
+                $params['standalone'] = '1';
+            }
+            if ((string)$request->request->get('conversation_only', $request->query->get('conversation_only', '0')) === '1') {
+                $params['conversation_only'] = '1';
+            }
+
+            return new RedirectResponse(url('whatsapp') . '?' . http_build_query($params));
         }
 
         return new JsonResponse([
@@ -1425,7 +1521,7 @@ HTML;
     /**
      * @param array<int> $allowed
      */
-    private function buildSharedData(AuthenticatedUser $user, array $options, array $allowed, bool $probeAltGateways = true): array
+    private function buildSharedData(AuthenticatedUser $user, array $options, array $allowed, bool $probeAltGateways = true, bool $includeWebEditCode = false): array
     {
         $lines = array_map(function (array $line): array {
             $line['rate_limit_preset'] = $this->service->detectRateLimitPreset($line);
@@ -1438,6 +1534,7 @@ HTML;
         $currentPermission = $this->service->resolveUserPermission($user);
         $agentPermissions = $user->isAdmin() ? $this->service->permissionsForAgents($agentsDirectory) : [];
         $permissionPresets = $user->isAdmin() ? $this->service->permissionPresets() : [];
+        $features = (array)config('app.features', []);
 
         return [
             'status' => $this->service->statusSummary($probeAltGateways),
@@ -1460,71 +1557,284 @@ HTML;
             'rateLimitPresets' => $this->service->rateLimitPresets(),
             'mediaTemplates' => $this->service->mediaTemplates(),
             'recentBroadcasts' => $this->service->recentBroadcasts(),
+            'features' => $features,
+            'webEditCode' => $includeWebEditCode ? $this->resolveWebEditCode() : null,
         ];
     }
 
     /**
      * @return array<string,array<string,mixed>>
      */
-    private function buildPanelDefinitions(AuthenticatedUser $user): array
+    private function buildPanelDefinitions(AuthenticatedUser $user, string $search = '', ?string $channel = null): array
     {
+        $search = trim(mb_strtolower($search));
+        $hasSearch = $search !== '';
+        $completedCount = $this->service->completedCount();
+        $completedThreads = $hasSearch ? $this->service->searchCompletedForUser($user, $search, 80) : [];
+
         $definitions = [
             'entrada' => [
                 'label' => 'Entrada',
                 'description' => 'Novas conversas aguardando triagem.',
                 'empty' => 'Nenhum cliente aguardando.',
-                'threads' => $this->service->queueThreadsForUser($user, 'arrival'),
+                'threads' => $this->limitThreads($this->filterThreadsByChannel($this->service->queueThreadsForUser($user, 'arrival'), $channel)),
                 'options' => ['panel' => 'entrada', 'allow_claim' => true, 'show_line' => true, 'show_agent' => true],
             ],
             'atendimento' => [
                 'label' => 'Atendimento',
                 'description' => 'Conversas em andamento com você.',
                 'empty' => 'Nenhuma conversa assumida.',
-                'threads' => $this->service->atendimentoThreadsForUser($user),
+                'threads' => $this->limitThreads($this->filterThreadsByChannel($this->service->atendimentoThreadsForUser($user), $channel)),
                 'options' => ['panel' => 'atendimento', 'show_line' => true, 'show_agent' => true],
             ],
             'grupos' => [
                 'label' => 'Grupos',
                 'description' => 'Conversas em grupos via WhatsApp Web.',
                 'empty' => 'Nenhum grupo com atividade.',
-                'threads' => $this->service->groupThreadsForUser($user),
+                'threads' => $this->limitThreads($this->filterThreadsByChannel($this->service->groupThreadsForUser($user, 20), $channel)),
                 'options' => ['panel' => 'grupos', 'show_preview' => true, 'show_line' => true, 'show_agent' => true],
             ],
             'parceiros' => [
                 'label' => 'Parceiros',
                 'description' => 'Leads encaminhados por parceiros.',
                 'empty' => 'Nenhum parceiro aguardando.',
-                'threads' => $this->service->queueThreadsForUser($user, 'partner'),
+                'threads' => $this->limitThreads($this->filterThreadsByChannel($this->service->queueThreadsForUser($user, 'partner'), $channel)),
                 'options' => ['panel' => 'parceiros', 'show_line' => true, 'show_agent' => true],
             ],
             'lembrete' => [
                 'label' => 'Lembrete',
                 'description' => 'Conversas aguardando follow-up.',
                 'empty' => 'Sem lembretes programados.',
-                'threads' => $this->service->reminderThreadsForUser($user),
+                'threads' => $this->limitThreads($this->filterThreadsByChannel($this->service->reminderThreadsForUser($user), $channel)),
                 'options' => ['panel' => 'lembrete', 'show_line' => true, 'show_agent' => true],
             ],
             'agendamento' => [
                 'label' => 'Agendamento',
                 'description' => 'Clientes com horário marcado.',
                 'empty' => 'Nenhum agendamento pendente.',
-                'threads' => $this->service->queueThreadsForUser($user, 'scheduled'),
+                'threads' => $this->limitThreads($this->filterThreadsByChannel($this->service->queueThreadsForUser($user, 'scheduled'), $channel)),
                 'options' => ['panel' => 'agendamento', 'show_line' => true, 'show_agent' => true],
             ],
             'concluidos' => [
                 'label' => 'Concluidos',
                 'description' => 'Histórico finalizado (pode reabrir).',
                 'empty' => 'Nenhuma conversa encerrada.',
-                'threads' => $this->service->completedThreadsForUser($user),
+                'threads' => $this->limitThreads($this->filterThreadsByChannel($completedThreads, $channel), 80),
+                'count_override' => $completedCount,
                 'options' => ['panel' => 'concluidos', 'show_preview' => true, 'allow_reopen' => true, 'show_queue' => true, 'show_line' => true, 'show_agent' => true],
             ],
         ];
+
+        if (isset($definitions['concluidos'])) {
+            $definitions['concluidos']['count_override'] = count($definitions['concluidos']['threads']);
+        }
+
+        if ($hasSearch) {
+            foreach ($definitions as $key => &$def) {
+                if ($key === 'concluidos') {
+                    $def['count_override'] = count($def['threads']);
+                    continue;
+                }
+                $filtered = $this->filterThreadsBySearch($def['threads'], $search);
+                $def['threads'] = $filtered;
+                $def['count_override'] = count($filtered);
+            }
+            unset($def);
+        }
 
         if (!$user->isAdmin()) {
             unset($definitions['grupos']);
         }
 
         return $definitions;
+    }
+
+    private function normalizeChannel(string $channel): ?string
+    {
+        $normalized = strtolower(trim($channel));
+        $allowed = ['meta', 'alt', 'alt_lab', 'alt_wpp'];
+        if ($normalized === '' || !in_array($normalized, $allowed, true)) {
+            return null;
+        }
+        return $normalized;
+    }
+
+    private function isAltThread(array $thread): bool
+    {
+        $channelId = (string)($thread['channel_thread_id'] ?? '');
+        return str_starts_with($channelId, 'alt:');
+    }
+
+    private function parseAltSlugFromThread(array $thread): array
+    {
+        $channelId = (string)($thread['channel_thread_id'] ?? '');
+        if (!str_starts_with($channelId, 'alt:')) {
+            return [null, null];
+        }
+
+        $payload = substr($channelId, 4);
+        $parts = explode(':', $payload, 2);
+        $slug = trim((string)($parts[0] ?? ''));
+        $digits = isset($parts[1]) ? preg_replace('/\D+/', '', (string)$parts[1]) : null;
+
+        return [$slug !== '' ? strtolower($slug) : null, $digits !== '' ? $digits : null];
+    }
+
+    /**
+     * Limits the amount of threads while keeping the most recently updated first.
+     *
+     * @param array<int,array<string,mixed>> $threads
+     * @return array<int,array<string,mixed>>
+     */
+    private function limitThreads(array $threads, int $limit = 60): array
+    {
+        if ($limit <= 0 || count($threads) <= $limit) {
+            return $threads;
+        }
+
+        usort($threads, static function (array $a, array $b): int {
+            $aDate = $a['last_message_at'] ?? $a['updated_at'] ?? $a['created_at'] ?? null;
+            $bDate = $b['last_message_at'] ?? $b['updated_at'] ?? $b['created_at'] ?? null;
+
+            if ($aDate === $bDate) {
+                return 0;
+            }
+
+            return ($aDate <=> $bDate) * -1; // desc
+        });
+
+        $limited = array_slice($threads, 0, $limit);
+        // Se por algum motivo o corte esvaziar a lista, mantém o resultado original para não sumir no UI.
+        return $limited === [] ? $threads : $limited;
+    }
+
+    private function filterThreadsByChannel(array $threads, ?string $channel): array
+    {
+        if ($channel === null) {
+            return $threads;
+        }
+
+        $channel = strtolower($channel);
+
+        if ($channel === 'meta') {
+            return array_values(array_filter($threads, fn(array $thread): bool => !$this->isAltThread($thread)));
+        }
+
+        $slugFilter = null;
+        if ($channel === 'alt_wpp') {
+            $slugFilter = static fn(?string $slug): bool => $slug !== null && str_starts_with($slug, 'wpp');
+        } elseif ($channel === 'alt_lab') {
+            $slugFilter = static fn(?string $slug): bool => $slug !== null && str_starts_with($slug, 'lab');
+        }
+
+        return array_values(array_filter($threads, function (array $thread) use ($slugFilter): bool {
+            if (!$this->isAltThread($thread)) {
+                return false;
+            }
+
+            if ($slugFilter === null) {
+                return true;
+            }
+
+            [$slug] = $this->parseAltSlugFromThread($thread);
+            return $slugFilter($slug);
+        }));
+    }
+
+    private function queueSummaryForChannel(array $base, array $lists): array
+    {
+        $summary = array_merge([
+            'arrival' => 0,
+            'scheduled' => 0,
+            'partner' => 0,
+            'reminder' => 0,
+        ], $base);
+
+        foreach (['arrival', 'scheduled', 'partner', 'reminder'] as $key) {
+            if (array_key_exists($key, $lists)) {
+                $summary[$key] = is_array($lists[$key]) ? count($lists[$key]) : (int)$summary[$key];
+            }
+        }
+
+        return $summary;
+    }
+
+    private function threadMatchesChannel(array $thread, ?string $channel): bool
+    {
+        if ($channel === null) {
+            return true;
+        }
+
+        $filtered = $this->filterThreadsByChannel([$thread], $channel);
+        return $filtered !== [];
+    }
+
+    /**
+     * @param array<int,array<string,mixed>> $threads
+     * @return array<int,array<string,mixed>>
+     */
+    private function filterThreadsBySearch(array $threads, string $search): array
+    {
+        if ($search === '') {
+            return $threads;
+        }
+
+        $digits = preg_replace('/\D+/', '', $search) ?: '';
+        $fields = [
+            'contact_name',
+            'contact_phone',
+            'contact_display',
+            'contact_display_secondary',
+            'last_message_preview',
+            'channel_thread_id',
+            'partner_name',
+            'responsible_name',
+            'line_label',
+        ];
+
+        return array_values(array_filter($threads, static function (array $thread) use ($search, $digits, $fields): bool {
+            foreach ($fields as $field) {
+                $value = isset($thread[$field]) ? (string)$thread[$field] : '';
+                if ($value !== '' && str_contains(mb_strtolower($value), $search)) {
+                    return true;
+                }
+            }
+
+            if ($digits !== '') {
+                $phoneRaw = isset($thread['contact_phone']) ? (string)$thread['contact_phone'] : '';
+                $phoneDigits = preg_replace('/\D+/', '', $phoneRaw) ?: '';
+                if ($phoneDigits !== '' && str_contains($phoneDigits, $digits)) {
+                    return true;
+                }
+            }
+
+            return false;
+        }));
+    }
+
+    private function expectsJson(Request $request): bool
+    {
+        if ($request->isXmlHttpRequest()) {
+            return true;
+        }
+
+        $accept = strtolower((string)$request->headers->get('accept', ''));
+        return str_contains($accept, 'application/json') || str_contains($accept, 'text/json');
+    }
+
+    private function redirectBack(Request $request, array $params = []): RedirectResponse
+    {
+        $target = (string)$request->headers->get('referer', '/whatsapp');
+        if ($target === '') {
+            $target = '/whatsapp';
+        }
+
+        if ($params !== []) {
+            $separator = str_contains($target, '?') ? '&' : '?';
+            $target .= $separator . http_build_query($params);
+        }
+
+        return new RedirectResponse($target);
     }
 
     private function queueLabels(): array
@@ -1561,10 +1871,7 @@ HTML;
             return;
         }
 
-        $expectedCode = trim((string)env('WHATSAPP_WEB_EDIT_CODE', ''));
-        if ($expectedCode === '') {
-            throw new RuntimeException('Configure o WHATSAPP_WEB_EDIT_CODE no .env antes de alterar linhas do WhatsApp Web.');
-        }
+        $expectedCode = $this->resolveWebEditCode();
 
         $providedCode = '';
         if (is_array($payload) && array_key_exists('web_edit_code', $payload)) {
@@ -1581,6 +1888,35 @@ HTML;
         if (!hash_equals($expectedCode, $providedCode)) {
             throw new RuntimeException('Código de autorização inválido para ajustar linhas do WhatsApp Web.');
         }
+    }
+
+    /**
+     * Resolve o código de edição de linhas Web. Se não houver no .env, gera e persiste de forma segura.
+     */
+    private function resolveWebEditCode(): string
+    {
+        $expectedCode = trim((string)env('WHATSAPP_WEB_EDIT_CODE', ''));
+        $cachePath = base_path('storage/whatsapp_web_edit_code.txt');
+
+        if ($expectedCode === '') {
+            if (is_file($cachePath)) {
+                $cached = trim((string)file_get_contents($cachePath));
+                if ($cached !== '') {
+                    $expectedCode = $cached;
+                }
+            }
+
+            if ($expectedCode === '') {
+                $expectedCode = strtoupper(bin2hex(random_bytes(4))); // 8 chars
+                @file_put_contents($cachePath, $expectedCode . "\n", LOCK_EX);
+            }
+        }
+
+        if ($expectedCode === '') {
+            throw new RuntimeException('Não foi possível determinar o código de autorização para linhas WhatsApp Web.');
+        }
+
+        return $expectedCode;
     }
 
     private function shouldRequireWebGatewayCode(?array $payload, ?array $current): bool

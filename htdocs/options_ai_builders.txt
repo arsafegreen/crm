@@ -1,0 +1,26 @@
+AI project builder options (focus on Copilot-friendly)
+
+1) GitHub Copilot Workspace (preview)
+- Link: https://github.com/features/copilot-workspace
+- Como funciona: voce descreve o objetivo; ele planeja passos, gera codigo e abre PR automaticamente. Disponibilidade limitada; requer acesso ao preview/enterprise.
+
+2) GitHub Codespaces + Copilot Edits/Chat (browser)
+- Link: https://github.com/features/codespaces
+- Como funciona: abre um codespace, cola um prompt grande (stack, entidades, rotas, UI). Usa Copilot Edits para aplicar arquivos inteiros. Custo: horas de Codespaces se passar da franquia gratuita; Copilot incluso na sua licenca.
+
+3) Copilot Edits no VS Code ou github.dev
+- Link: https://code.visualstudio.com/docs/copilot/copilot-edits
+- Como funciona: comando de edicao que cria/ajusta arquivos com prompts deterministicos ("crie routes/api.php com CRUD X", "gere controller Y completo"). Sem custo extra alem da licenca Copilot.
+
+4) Fluxo em blocos com Copilot Chat
+- Link: https://docs.github.com/copilot/getting-started-with-github-copilot-in-vs-code/copilot-chat
+- Como funciona: peça em etapas (plano de arquivos -> migrations -> controllers -> views -> JS/CSS). Melhor consistencia que pedir o projeto inteiro de uma vez.
+
+5) Builders de terceiros gratuitos (opcionais)
+- GoCodeo: https://marketplace.visualstudio.com/items?itemName=gocodeo.gocodeo
+- Forge Webbuilder: https://marketplace.visualstudio.com/items?itemName=bugzi.forge-webbuilder
+- Como funciona: geram scaffold full-stack com um prompt. Podem usar sua propria API key (modelo) ou modo gratuito limitado. Nao sao integrados nativamente ao GitHub, mas funcionam com git normalmente.
+
+6) Template-base + adaptacao pelo Copilot
+- Exemplo de templates Laravel: https://laravel.com/docs/starter-kits
+- Como funciona: pegue um boilerplate (auth, Tailwind, etc.) e peça ao Copilot Edits para adaptar ao seu dominio (entidades, rotas, validacoes, seeds). Reduz risco estrutural porque o esqueleto ja existe.

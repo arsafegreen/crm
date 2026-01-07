@@ -6,6 +6,7 @@ namespace App\Repositories;
 
 use App\Database\Connection;
 use PDO;
+use function digits_only;
 
 final class WhatsappThreadRepository
 {
@@ -387,6 +388,53 @@ final class WhatsappThreadRepository
         $row = $stmt->fetch(PDO::FETCH_ASSOC);
 
         return $row !== false ? $row : null;
+    }
+
+    public function countClosed(): int
+    {
+        $stmt = $this->pdo->query('SELECT COUNT(*) FROM whatsapp_threads WHERE status = "closed"');
+        $value = $stmt ? $stmt->fetchColumn() : 0;
+        return (int)($value ?? 0);
+    }
+
+    public function searchClosed(string $query, int $limit = 60): array
+    {
+        $query = trim(mb_strtolower($query));
+        if ($query === '') {
+            return [];
+        }
+
+        $limit = max(1, min(200, $limit));
+        $digits = digits_only($query);
+
+        $sql =
+            'SELECT t.*, c.name AS contact_name, c.phone AS contact_phone, c.client_id AS contact_client_id, p.name AS partner_name, u.name AS responsible_name,
+                    l.label AS line_label, l.display_phone AS line_display_phone, l.provider AS line_provider
+             FROM whatsapp_threads t
+             INNER JOIN whatsapp_contacts c ON c.id = t.contact_id
+             LEFT JOIN partners p ON p.id = t.partner_id
+             LEFT JOIN users u ON u.id = t.responsible_user_id
+             LEFT JOIN whatsapp_lines l ON l.id = t.line_id
+             WHERE t.status = "closed"
+               AND (
+                    LOWER(c.name) LIKE :qs
+                 OR LOWER(t.last_message_preview) LIKE :qs
+                 OR LOWER(COALESCE(t.channel_thread_id, "")) LIKE :qs
+                 OR LOWER(COALESCE(p.name, "")) LIKE :qs
+                 ' . ($digits !== '' ? 'OR REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(c.phone, "+", ""), "(", ""), ")", ""), "-", ""), " ", "") LIKE :digits' : '') . '
+               )
+             ORDER BY (t.last_message_at IS NULL) ASC, t.last_message_at DESC, t.updated_at DESC
+             LIMIT :limit';
+
+        $stmt = $this->pdo->prepare($sql);
+        $stmt->bindValue(':qs', '%' . $query . '%');
+        if ($digits !== '') {
+            $stmt->bindValue(':digits', '%' . $digits . '%');
+        }
+        $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
+        $stmt->execute();
+
+        return $stmt->fetchAll(PDO::FETCH_ASSOC) ?: [];
     }
 
     /**

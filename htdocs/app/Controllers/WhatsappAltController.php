@@ -17,6 +17,9 @@ use function base_path;
 use function bin2hex;
 use function config;
 use function hash;
+use function date;
+use function preg_replace;
+use function str_replace;
 use function random_bytes;
 use function strlen;
 use function str_starts_with;
@@ -69,6 +72,11 @@ final class WhatsappAltController
             $payload = $this->callGateway($instance, 'GET', '/qr');
         } catch (RuntimeException $exception) {
             return new JsonResponse(['error' => $exception->getMessage()], 502);
+        }
+
+        $httpStatus = (int)($payload['__status'] ?? 0);
+        if ($httpStatus === Response::HTTP_NO_CONTENT) {
+            return new JsonResponse([], Response::HTTP_NO_CONTENT);
         }
 
         $rawQr = (string)($payload['qr'] ?? '');
@@ -234,12 +242,25 @@ final class WhatsappAltController
     {
         $instance = $this->resolveWebhookInstance($request);
         if ($instance === null) {
+            $this->logWebhookError('unauthorized', 'Webhook sem token válido.', [
+                'request_id' => bin2hex(random_bytes(3)),
+                'raw_headers' => $request->headers->all(),
+                'query' => $request->query->all(),
+            ]);
             return new JsonResponse(['error' => 'unauthorized'], 401);
         }
 
         $requestId = bin2hex(random_bytes(6));
 
         $payload = json_decode($request->getContent(), true);
+        $isWpp = is_array($payload) && isset($payload['event'], $payload['data']);
+        if ($isWpp) {
+            $converted = $this->convertWppconnectPayload($payload, $instance['slug'] ?? 'unknown');
+            if ($converted !== null) {
+                $payload = $converted;
+            }
+        }
+
         if (!is_array($payload)) {
             $this->logWebhookError('invalid_payload', 'JSON inválido recebido no webhook.', [
                 'instance' => $instance['slug'] ?? 'unknown',
@@ -275,6 +296,7 @@ final class WhatsappAltController
             'media' => $payload['media'] ?? null,
             'raw' => $payload,
             'payload_hash' => substr(hash('sha256', json_encode($payload)), 0, 12),
+            'provider' => $isWpp ? 'wppconnect' : 'alt_gateway',
         ];
         @file_put_contents($logFile, json_encode($logEntry, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) . PHP_EOL, FILE_APPEND);
 
@@ -392,6 +414,25 @@ final class WhatsappAltController
         }
 
         $rawPhone = $hintPhone !== '' ? $hintPhone : (string)($payload['phone'] ?? '');
+
+        // Se o gateway mandou um ID (ou vazio), tenta extrair telefone de outras pistas
+        $phoneCandidates = [
+            $rawPhone,
+            (string)($payload['contact_hint']['phone'] ?? ''),
+            (string)($meta['contact_phone'] ?? ''),
+            (string)($meta['wa_id'] ?? ''),
+        ];
+        $participantMeta = $meta['participant'] ?? ($meta['group_participant'] ?? null);
+        if (is_array($participantMeta)) {
+            $phoneCandidates[] = (string)($participantMeta['phone'] ?? '');
+        }
+        $rawPhone = $this->pickLikelyPhone($phoneCandidates);
+
+        $mappedPhone = $this->mapAltJidToPhone($rawPhone, $meta);
+        if ($mappedPhone !== null) {
+            $rawPhone = $mappedPhone;
+        }
+
         $normalizedPhone = $this->normalizeWebhookPhone($instance, $rawPhone, $meta);
 
         $entry = [
@@ -533,8 +574,8 @@ final class WhatsappAltController
             $connectTimeout = min($timeout, 2);
         } elseif ($path === '/qr') {
             // QR pode ser um pouco mais lento, mas ainda limitado.
-            $timeout = min($timeout, 8);
-            $connectTimeout = min($timeout, 4);
+            $timeout = max($timeout, 12);
+            $connectTimeout = min($timeout, 6);
         }
 
         if ($timeout < 4) {
@@ -549,6 +590,7 @@ final class WhatsappAltController
         if ($raw === false) {
             $error = curl_error($ch) ?: 'curl_error';
             curl_close($ch);
+            $this->logGatewayFailure($instance, $path, 0, $error, '');
             throw new RuntimeException('Falha ao contatar gateway: ' . $error);
         }
         $status = (int)curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
@@ -556,22 +598,26 @@ final class WhatsappAltController
         curl_close($ch);
 
         if ($status >= 400) {
+            $this->logGatewayFailure($instance, $path, $status, (string)$raw, $contentType);
             throw new RuntimeException('Gateway respondeu com erro HTTP ' . $status);
         }
 
+        $basePayload = [
+            '__status' => $status,
+            '__raw' => $raw,
+            '__content_type' => $contentType,
+        ];
+
         if ($expectJson === false) {
-            return [
-                'raw' => $raw ?? '',
-                'content_type' => $contentType,
-            ];
+            return $basePayload;
         }
 
         if ($raw === '' || $raw === null) {
-            return [];
+            return $basePayload;
         }
 
         $decoded = json_decode($raw, true);
-        return is_array($decoded) ? $decoded : [];
+        return is_array($decoded) ? array_merge($basePayload, $decoded) : $basePayload;
     }
 
     private function coerceTimestamp($value): ?int
@@ -589,6 +635,20 @@ final class WhatsappAltController
         return $parsed !== false ? $parsed : null;
     }
 
+    private function logGatewayFailure(array $instance, string $path, int $status, string $raw, string $contentType): void
+    {
+        $slug = (string)($instance['slug'] ?? 'unknown');
+        $snippet = $raw !== '' ? substr(str_replace(["\r", "\n"], ' ', $raw), 0, 800) : '';
+
+        AlertService::push('whatsapp.alt_gateway_error', 'Falha ao chamar gateway', [
+            'instance' => $slug,
+            'path' => $path,
+            'status' => $status,
+            'content_type' => $contentType,
+            'body_snippet' => $snippet,
+        ]);
+    }
+
     private function normalizeWebhookPhone(array $instance, string $rawPhone, array $meta = []): string
     {
         // Se houver mapeamento manual de JID alt -> telefone real, aplica antes de qualquer fallback.
@@ -599,7 +659,8 @@ final class WhatsappAltController
         $isBrazil = ($len === 10) || ($len === 11 && $digits[2] === '9');
 
         if ($isBrazil) {
-            return format_phone($digits);
+            // Mantém só dígitos; formatação acontece na camada de view.
+            return $digits;
         }
 
         $hasPrivacyJid = false;
@@ -610,7 +671,7 @@ final class WhatsappAltController
         }
 
         if ($digits !== '') {
-            // Keep the mapped/raw digits for non-BR numbers (or privacy JIDs) to avoid overwriting with the line phone.
+            // Mantém dígitos crus para não misturar com telefone da linha.
             return $digits;
         }
 
@@ -618,16 +679,81 @@ final class WhatsappAltController
             return $rawPhone;
         }
 
-        // If nothing usable came in the payload, fall back to the line phone to keep the thread reachable.
-        $line = $this->whatsapp->lineByAltSlug((string)($instance['slug'] ?? ''));
-        if ($line && !empty($line['display_phone'])) {
-            $fallbackDigits = preg_replace('/\D+/', '', (string)$line['display_phone']) ?: '';
-            if ($fallbackDigits !== '') {
-                return format_phone($fallbackDigits);
+        // Sem telefone confiável, não usar fallback da linha para evitar threads duplicados por linha.
+        return $rawPhone;
+    }
+
+    private function convertWppconnectPayload(array $payload, string $instanceSlug): ?array
+    {
+        // wppconnect: { event, instanceId, data: {...}} structure
+        $data = $payload['data'] ?? null;
+        if (!is_array($data)) {
+            return null;
+        }
+
+        $event = strtolower((string)($payload['event'] ?? ''));
+        $fromMe = (bool)($data['fromMe'] ?? false);
+        $chatId = (string)($data['chatId'] ?? ($data['sender']['id'] ?? ''));
+        $waId = preg_replace('/\D+/', '', $chatId) ?: '';
+        $direction = $event === 'onack' ? 'ack' : ($fromMe ? 'outgoing' : 'incoming');
+
+        $msgId = null;
+        if (isset($data['id']) && is_array($data['id'])) {
+            $msgId = $data['id']['_serialized'] ?? $data['id']['id'] ?? null;
+        } elseif (is_string($data['id'] ?? null)) {
+            $msgId = $data['id'];
+        }
+
+        $meta = [
+            'message_id' => $msgId,
+            'meta_message_id' => $msgId,
+            'chat_id' => $chatId,
+            'timestamp' => $data['timestamp'] ?? null,
+            'gateway_instance' => $instanceSlug,
+            'from_me' => $fromMe,
+            'raw_type' => $data['type'] ?? null,
+            'ack' => $data['ack'] ?? null,
+            'is_group' => (bool)($data['isGroupMsg'] ?? false),
+        ];
+
+        $contactHint = [
+            'name' => $data['sender']['pushname'] ?? ($data['sender']['name'] ?? null),
+            'phone' => $waId,
+            'photo' => $data['sender']['profilePicThumbObj']['imgFull'] ?? ($data['sender']['profilePicThumbObj']['img'] ?? null),
+            'source' => 'wppconnect',
+        ];
+
+        $messageBody = (string)($data['body'] ?? '');
+        if ($messageBody === '' && isset($data['caption'])) {
+            $messageBody = (string)$data['caption'];
+        }
+
+        $media = null;
+        $msgType = strtolower((string)($data['type'] ?? 'chat'));
+        if ($msgType !== 'chat' && $msgType !== '') {
+            $media = [
+                'type' => $msgType,
+                'mimetype' => $data['mimetype'] ?? ($data['mime'] ?? null),
+                'url' => $data['body'] ?? null,
+                'filename' => $data['filename'] ?? null,
+                'caption' => $data['caption'] ?? null,
+            ];
+            if ($messageBody === '' && is_string($media['caption'] ?? null)) {
+                $messageBody = (string)$media['caption'];
+            }
+            if ($messageBody === '' && $msgType !== '') {
+                $messageBody = '[' . strtoupper($msgType) . ']';
             }
         }
 
-        return $rawPhone;
+        return [
+            'phone' => $waId,
+            'direction' => $direction,
+            'message' => $messageBody,
+            'contact_hint' => $contactHint,
+            'meta' => $meta,
+            'media' => $media,
+        ];
     }
 
     private function mapAltJidToPhone(string $rawPhone, array $meta = []): ?string
@@ -662,6 +788,43 @@ final class WhatsappAltController
         }
 
         return null;
+    }
+
+    /**
+     * @param array<int,string> $candidates
+     */
+    private function pickLikelyPhone(array $candidates): string
+    {
+        foreach ($candidates as $candidate) {
+            if (!is_string($candidate)) {
+                continue;
+            }
+            $digits = preg_replace('/\D+/', '', $candidate) ?: '';
+            if ($digits === '') {
+                continue;
+            }
+            $len = strlen($digits);
+            // Prefere telefones BR com 10/11 dígitos (com celular iniciando em 9)
+            if ($len === 10) {
+                return $digits;
+            }
+            if ($len === 11 && $digits[2] === '9') {
+                return $digits;
+            }
+        }
+
+        // fallback: primeiro que tiver dígitos
+        foreach ($candidates as $candidate) {
+            if (!is_string($candidate)) {
+                continue;
+            }
+            $digits = preg_replace('/\D+/', '', $candidate) ?: '';
+            if ($digits !== '') {
+                return $digits;
+            }
+        }
+
+        return '';
     }
 
     /**
@@ -712,20 +875,33 @@ final class WhatsappAltController
     private function resolveWebhookInstance(Request $request): ?array
     {
         $header = $this->resolveAuthorizationHeader($request);
-        if ($header === '') {
+        $gatewayHeader = (string)$request->headers->get('X-Gateway-Token', '');
+        $queryToken = (string)$request->query->get('token', $request->query->get('webhook_token', ''));
+
+        $candidates = array_filter([
+            $header,
+            $gatewayHeader,
+            $queryToken,
+        ], static fn($value) => is_string($value) && trim($value) !== '');
+
+        if ($candidates === []) {
             return null;
         }
 
-        $token = str_starts_with($header, 'Bearer ') ? substr($header, 7) : $header;
-        $token = trim((string)$token);
-        if ($token === '') {
-            return null;
-        }
+        $normalizedTokens = array_map(static function ($candidate) {
+            $token = str_starts_with($candidate, 'Bearer ') ? substr($candidate, 7) : $candidate;
+            return trim((string)$token);
+        }, $candidates);
 
         foreach ($this->whatsapp->altGatewayInstances() as $instance) {
             $configured = trim((string)($instance['webhook_token'] ?? ''));
-            if ($configured !== '' && hash_equals($configured, $token)) {
-                return $instance;
+            if ($configured === '') {
+                continue;
+            }
+            foreach ($normalizedTokens as $token) {
+                if ($token !== '' && hash_equals($configured, $token)) {
+                    return $instance;
+                }
             }
         }
 
@@ -1055,6 +1231,7 @@ final class WhatsappAltController
     {
         $record = [
             'ts' => time(),
+            'date' => date('c'),
             'type' => $type,
             'message' => $message,
             'instance' => $context['instance'] ?? 'unknown',
@@ -1078,7 +1255,7 @@ final class WhatsappAltController
 
     private function logWebhookTrace(array $data): void
     {
-        $record = ['ts' => time()] + $data;
+        $record = ['ts' => time(), 'date' => date('c')] + $data;
         @file_put_contents(
             base_path('storage/logs/whatsapp_alt_trace.log'),
             json_encode($record, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) . PHP_EOL,

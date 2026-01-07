@@ -231,6 +231,52 @@ final class CrmController
         return json_response(['items' => $items]);
     }
 
+    public function quickClientSearch(Request $request): Response
+    {
+        $authUser = $this->currentUser($request);
+        if ($authUser === null) {
+            return json_response(['error' => 'Não autenticado.'], 401);
+        }
+
+        $query = trim((string)$request->query->get('q', ''));
+        if (mb_strlen($query) < 2) {
+            return json_response(['items' => []]);
+        }
+
+        $limit = (int)$request->query->get('limit', 8);
+        $limit = max(1, min(20, $limit));
+
+        $clientRepo = new ClientRepository();
+        [$restrictedAvpNames, $allowOnlineClients] = $this->avpRestrictionContext($authUser);
+        $results = $clientRepo->quickSearch($query, $limit, $restrictedAvpNames, $allowOnlineClients);
+
+        $items = array_map(static function (array $row): array {
+            $document = digits_only((string)($row['document'] ?? ''));
+            $titularDocument = digits_only((string)($row['titular_document'] ?? ''));
+            $extraPhones = [];
+            if (isset($row['extra_phones']) && is_array($row['extra_phones'])) {
+                $extraPhones = array_values(array_filter(array_map(static function ($value): string {
+                    return digits_only((string)$value);
+                }, $row['extra_phones']), static fn(string $value): bool => $value !== ''));
+            }
+
+            return [
+                'id' => (int)($row['id'] ?? 0),
+                'name' => (string)($row['name'] ?? ''),
+                'document' => $document !== '' ? $document : null,
+                'document_formatted' => $document !== '' ? format_document($document) : null,
+                'titular_document' => $titularDocument !== '' ? $titularDocument : null,
+                'titular_document_formatted' => $titularDocument !== '' ? format_document($titularDocument) : null,
+                'status' => $row['status'] ?? null,
+                'phone' => digits_only((string)($row['phone'] ?? '')) ?: null,
+                'whatsapp' => digits_only((string)($row['whatsapp'] ?? '')) ?: null,
+                'extra_phones' => $extraPhones,
+            ];
+        }, $results);
+
+        return json_response(['items' => $items]);
+    }
+
     public function createClient(Request $request): Response
     {
         $clientRepo = new ClientRepository();
@@ -788,8 +834,13 @@ final class CrmController
 
         $currentYear = (int)date('Y');
         $expirationYear = (int)$request->query->get('expiration_year', $currentYear);
-        if ($expirationYear < 2020 || $expirationYear > 2040) {
+        if ($expirationYear < 2020 || $expirationYear > 2045) {
             $expirationYear = $currentYear;
+        }
+
+        $issueYear = (int)$request->query->get('issue_year', 0);
+        if ($issueYear < 2020 || $issueYear > 2045) {
+            $issueYear = 0;
         }
 
         $documentType = (string)$request->query->get('document_type', '');
@@ -844,6 +895,7 @@ final class CrmController
             'expiration_date' => $expirationDateInput,
             'expiration_date_start' => $expirationDateStart,
             'expiration_date_end' => $expirationDateEnd,
+            'issue_year' => $issueYear,
             'document_type' => $documentType,
             'birthday_month' => $birthdayMonth,
             'birthday_day' => $birthdayDay,
@@ -876,6 +928,7 @@ final class CrmController
                 'meta' => [
                     'count' => 0,
                     'total' => 0,
+                    'document_counts' => ['cnpj' => 0, 'cpf' => 0],
                 ],
             ];
         }
@@ -902,7 +955,8 @@ final class CrmController
             'meta' => $result['meta'] ?? ['count' => count($result['data']), 'total' => $result['pagination']['total'] ?? 0],
             'statusLabels' => $clientRepo->statusLabels(),
             'perPage' => $perPage,
-            'yearOptions' => range(2020, 2040),
+            'yearOptions' => range(2020, 2045),
+            'issueYearOptions' => range(2020, 2045),
             'viewMode' => $viewMode,
             'offScope' => $offScope,
             'partnerIndicators' => $partnerIndicators,
@@ -924,6 +978,7 @@ final class CrmController
             || ($filters['expiration_scope'] ?? 'current') === 'all'
             || (int)($filters['birthday_month'] ?? 0) > 0
             || ($filters['expiration_date'] ?? '') !== ''
+            || (int)($filters['issue_year'] ?? 0) > 0
             || ($filters['last_avp_name'] ?? '') !== '';
     }
 

@@ -399,6 +399,12 @@ $panelDefinitions = [
     .wa-alt-card { border:1px solid rgba(82,101,143,0.4); border-radius:16px; padding:16px; background:rgba(9,15,30,0.8); }
     .wa-alt-card header { display:flex; justify-content:space-between; align-items:flex-start; gap:12px; flex-wrap:wrap; }
     .wa-alt-actions { display:flex; flex-wrap:wrap; gap:8px; margin:12px 0; }
+    .wa-gateway-toggle { border:1px solid #38bdf8; background:linear-gradient(135deg,#0ea5e9,#0284c7); color:#0b1224; font-weight:600; box-shadow:0 10px 30px rgba(14,165,233,0.25); }
+    .wa-gateway-toggle.is-stop { border-color:#f87171; background:linear-gradient(135deg,#ef4444,#dc2626); color:#fff; box-shadow:0 10px 30px rgba(248,113,113,0.3); }
+    .wa-gateway-toggle.is-busy { opacity:0.85; pointer-events:none; position:relative; }
+    .wa-gateway-toggle.is-busy::after { content:''; position:absolute; right:10px; top:50%; width:14px; height:14px; margin-top:-7px; border-radius:999px; border:2px solid rgba(255,255,255,0.5); border-top-color:#fff; animation:wa-spin 0.9s linear infinite; }
+    .wa-gateway-clean { border-color:#fbbf24; color:#fef3c7; background:rgba(251,191,36,0.15); }
+    @keyframes wa-spin { to { transform:rotate(360deg); } }
     .wa-alt-meta { list-style:none; margin:12px 0 0; padding:0; font-size:0.85rem; color:var(--muted); }
     .wa-alt-meta li { display:flex; justify-content:space-between; gap:8px; padding:4px 0; border-bottom:1px dashed rgba(148,163,184,0.25); }
     .wa-alt-qr { margin-top:12px; border:1px dashed rgba(56,189,248,0.4); padding:12px; border-radius:14px; }
@@ -803,9 +809,14 @@ document.addEventListener('DOMContentLoaded', function() {
                                     </div>
                                     <label class="wa-form-field" data-web-lock-field hidden>
                                         <span>Código de autorização (WhatsApp Web)</span>
-                                        <input type="password" name="web_edit_code" autocomplete="off" placeholder="Informe o código para alterar linhas baseadas em WhatsApp Web">
+                                        <input type="password" name="web_edit_code" autocomplete="off" placeholder="Informe o código para alterar linhas baseadas em WhatsApp Web" value="<?= htmlspecialchars((string)($webEditCode ?? ''), ENT_QUOTES, 'UTF-8'); ?>">
                                     </label>
-                                    <small class="wa-feedback" data-web-lock-hint hidden>Precisamos do código de autorização antes de salvar ajustes no gateway via WhatsApp Web.</small>
+                                    <small class="wa-feedback" data-web-lock-hint hidden>
+                                        Precisamos do código de autorização antes de salvar ajustes no gateway via WhatsApp Web.
+                                        <?php if (!empty($webEditCode ?? '')): ?>
+                                            Código já preenchido para você (admin). Guarde-o em local seguro.
+                                        <?php endif; ?>
+                                    </small>
                                     <div class="wa-alt-inline" data-line-alt-inline hidden>
                                         <p class="wa-empty" style="margin:0;">Associe esta linha a uma instância do gateway alternativo.</p>
                                         <label class="wa-form-field">
@@ -895,10 +906,10 @@ document.addEventListener('DOMContentLoaded', function() {
                                                     </header>
                                                     <strong data-alt-gateway-status>Carregando status...</strong>
                                                     <div class="wa-alt-actions">
-                                                        <button type="button" class="ghost" data-alt-gateway-start>Iniciar gateway</button>
+                                                        <button type="button" class="ghost wa-gateway-toggle" data-alt-gateway-start>Iniciar gateway</button>
                                                         <button type="button" class="ghost" data-alt-gateway-refresh>Atualizar</button>
                                                         <button type="button" class="ghost" data-alt-gateway-qr>Mostrar QR</button>
-                                                        <button type="button" class="ghost danger" data-alt-gateway-reset>Reiniciar sessão</button>
+                                                        <button type="button" class="ghost wa-gateway-clean" data-alt-gateway-clean>Limpar sessão / QR</button>
                                                     </div>
                                                     <small class="wa-feedback" data-alt-gateway-feedback></small>
                                                     <ul class="wa-alt-meta">
@@ -908,7 +919,7 @@ document.addEventListener('DOMContentLoaded', function() {
                                                         <li><span>Histórico</span><strong data-alt-gateway-history>--</strong></li>
                                                     </ul>
                                                     <div class="wa-alt-qr" data-alt-gateway-qr-panel hidden>
-                                                        <p class="wa-empty">Escaneie com o número de testes desta instância.</p>
+                                                        <p class="wa-empty" data-alt-gateway-qr-placeholder>Escaneie com o número de testes desta instância.</p>
                                                         <img data-alt-gateway-qr-image src="" alt="QR Code WhatsApp Web">
                                                         <div class="wa-alt-qr-actions">
                                                             <button type="button" class="ghost" data-alt-gateway-qr-popup disabled>Abrir em nova aba</button>
@@ -989,9 +1000,13 @@ document.addEventListener('DOMContentLoaded', function() {
                                             $altInstance = $altSlug !== '' ? ($altGatewayMap[$altSlug] ?? null) : null;
                                             $gatewayStatus = $status['alt_gateway_status'][$altSlug] ?? [];
                                             $gatewayReachable = !empty($gatewayStatus) && !empty($gatewayStatus['ok']);
-                                            $gatewayReady = $gatewayReachable && !empty($gatewayStatus['ready']);
-                                            $gatewayLabel = $altInstance['label'] ?? 'Gateway alternativo';
                                             $statusHint = strtolower((string)($gatewayStatus['status'] ?? ''));
+                                            $looksReady = str_contains($statusHint, 'open')
+                                                || str_contains($statusHint, 'online')
+                                                || str_contains($statusHint, 'connected')
+                                                || str_contains($statusHint, 'ready');
+                                            $gatewayReady = $gatewayReachable && (!empty($gatewayStatus['ready']) || $looksReady);
+                                            $gatewayLabel = $altInstance['label'] ?? 'Gateway alternativo';
                                             $statusMap = [
                                                 'qr' => 'aguardando QR',
                                                 'pairing' => 'pareando',
@@ -1040,7 +1055,10 @@ document.addEventListener('DOMContentLoaded', function() {
                                                             <div class="wa-line-actions">
                                                                 <button type="button" class="ghost" data-line-gateway-qr>Novo QR</button>
                                                                 <button type="button" class="ghost" data-line-gateway-qr-history>QR histórico</button>
-                                                                <button type="button" class="ghost" data-line-gateway-start>Iniciar gateway</button>
+                                                                <button type="button" class="ghost wa-gateway-toggle" data-line-gateway-start>
+                                                                    Iniciar gateway
+                                                                </button>
+                                                                <button type="button" class="ghost wa-gateway-toggle" data-line-gateway-stop>Parar gateway</button>
                                                             </div>
                                                         </div>
                                                     <?php elseif (!empty($altGateways ?? [])): ?>

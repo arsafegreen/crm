@@ -8,6 +8,8 @@ use App\Auth\AuthenticatedUser;
 use App\Repositories\ClientRepository;
 use App\Repositories\ClientProtocolRepository;
 use App\Repositories\CertificateRepository;
+use App\Services\CertificateService;
+use App\Services\CustomerService;
 use App\Repositories\CopilotManualRepository;
 use App\Repositories\CopilotProfileRepository;
 use App\Repositories\CopilotTrainingSampleRepository;
@@ -56,8 +58,16 @@ final class WhatsappService
     private const STOPWORDS = [
         'para', 'com', 'essa', 'isso', 'este', 'esta', 'como', 'onde', 'quando', 'porque',
         'mais', 'ainda', 'pois', 'sobre', 'contato', 'cliente', 'mensagem', 'dessa', 'desse',
-        'vamos', 'preciso', 'precisa', 'também', 'agora', 'apenas', 'favor', 'segue', 'seguei',
+        'vamos', 'preciso', 'precisa', 'tambem', 'também', 'agora', 'apenas', 'favor', 'segue', 'seguei',
     ];
+    private const KEYWORD_STOPWORDS = [
+        'para', 'com', 'essa', 'isso', 'este', 'esta', 'como', 'onde', 'quando', 'porque',
+        'mais', 'ainda', 'pois', 'sobre', 'contato', 'cliente', 'mensagem', 'dessa', 'desse',
+        'vamos', 'preciso', 'precisa', 'tambem', 'também', 'agora', 'apenas', 'favor', 'segue', 'seguei',
+        'ola', 'olá', 'bom', 'boa', 'dia', 'tarde', 'noite', 'obrigado', 'obrigada', 'ok', 'certo',
+        'agradeco', 'agradeço',
+    ];
+    private const COPILOT_SUGGESTION_CACHE_TTL = 15;
     private const PANEL_DEFAULTS = [
         'entrada' => ['mode' => 'all', 'users' => []],
         'atendimento' => ['mode' => 'own', 'users' => []],
@@ -220,11 +230,21 @@ final class WhatsappService
     private ClientRepository $clients;
     private ClientProtocolRepository $clientProtocols;
     private CertificateRepository $certificates;
+    private CertificateService $certificateService;
+    private CustomerService $customerService;
     private CopilotTrainingSampleRepository $trainingSamples;
     private WhatsappUserPermissionRepository $userPermissions;
     private WhatsappBroadcastRepository $broadcasts;
     private array $permissionCache = [];
     private ?array $altGatewayConfig = null;
+    private int $altGatewayDailyLimitDefault = 0;
+    private int $altGatewayRotationWindowHours = 24;
+    private float $altPerNumberWindowHours = 24.0;
+    private int $altPerNumberLimit = 1;
+    private ?float $altPerCampaignWindowHours = null;
+    private ?int $altPerCampaignLimit = null;
+    private ?array $altGatewayUsageCache = null;
+    private ?string $lastAltGatewaySelected = null;
     private array $clientCacheById = [];
     private array $clientCacheByPhone = [];
     /** @var array<int,array{has_protocol:bool,protocol_state:?string,protocol_number:?string,protocol_expires_at:?int}> */
@@ -239,7 +259,11 @@ final class WhatsappService
     private array $linesCache = ['ts' => 0, 'data' => []];
     /** @var array<int,array{ts:int,data:array}> */
     private array $agentsCacheByExclude = [];
+    /** @var array{ts:int,key:string,data:?array} */
+    private array $copilotSuggestionCache = ['ts' => 0, 'key' => '', 'data' => null];
     private WhatsappGatewayBackup $gatewayBackup;
+    private bool $archivedInactiveOnce = false;
+    private array $completedCountCache = ['ts' => 0, 'value' => null];
 
     public function __construct(
         ?SettingRepository $settings = null,
@@ -256,6 +280,8 @@ final class WhatsappService
         ?ClientRepository $clients = null,
         ?ClientProtocolRepository $clientProtocols = null,
         ?CertificateRepository $certificates = null,
+        ?CertificateService $certificateService = null,
+        ?CustomerService $customerService = null,
         ?WhatsappBroadcastRepository $broadcasts = null,
         ?WhatsappGatewayBackup $gatewayBackup = null
     ) {
@@ -273,6 +299,8 @@ final class WhatsappService
         $this->clients = $clients ?? new ClientRepository();
         $this->clientProtocols = $clientProtocols ?? new ClientProtocolRepository();
         $this->certificates = $certificates ?? new CertificateRepository();
+        $this->certificateService = $certificateService ?? new CertificateService($this->certificates);
+        $this->customerService = $customerService ?? new CustomerService($this->clients);
         $this->broadcasts = $broadcasts ?? new WhatsappBroadcastRepository();
         $this->gatewayBackup = $gatewayBackup ?? new WhatsappGatewayBackup();
     }
@@ -756,6 +784,8 @@ public function dispatchBroadcast(array $input, AuthenticatedUser $actor): array
         $altInstances = $probeAltGateways ? $this->altGatewayInstances() : [];
         $altStatuses = [];
         $linesByAlt = [];
+        $usageWindowHours = $this->altGatewayUsageWindowHours();
+        $usageSnapshot = $probeAltGateways ? $this->altGatewayUsage() : [];
         if ($probeAltGateways) {
             foreach ($lines as $line) {
                 $altSlug = trim((string)($line['alt_gateway_instance'] ?? ''));
@@ -772,11 +802,21 @@ public function dispatchBroadcast(array $input, AuthenticatedUser $actor): array
                         'label' => $instance['label'],
                         'ready' => false,
                         'ok' => false,
+                        'usage' => [
+                            'window_hours' => $usageWindowHours,
+                            'sent' => $usageSnapshot[$slug] ?? 0,
+                            'limit' => max(0, (int)($instance['daily_limit'] ?? 0)),
+                        ],
                     ];
                     continue;
                 }
                 $status['slug'] = $slug;
                 $status['label'] = $instance['label'];
+                $status['usage'] = [
+                    'window_hours' => $usageWindowHours,
+                    'sent' => $usageSnapshot[$slug] ?? 0,
+                    'limit' => max(0, (int)($instance['daily_limit'] ?? 0)),
+                ];
                 if (!empty($status['ready'])) {
                     $readyCount++;
                 }
@@ -1176,7 +1216,7 @@ public function dispatchBroadcast(array $input, AuthenticatedUser $actor): array
         return array_values($reminders);
     }
 
-    public function completedThreads(int $limit = 200): array
+    public function completedThreads(int $limit = 120): array
     {
         $threads = $this->decorateThreads($this->threads->listByStatus(['closed'], $limit));
         return $this->filterOutGroupThreads($threads);
@@ -1191,6 +1231,11 @@ public function dispatchBroadcast(array $input, AuthenticatedUser $actor): array
 
     public function archiveInactiveThreads(int $days = 30, int $batch = 200): void
     {
+        if ($this->archivedInactiveOnce) {
+            return;
+        }
+        $this->archivedInactiveOnce = true;
+
         $days = max(1, $days);
         $threshold = now() - ($days * 86400);
         $ids = $this->threads->listInactiveOlderThan($threshold, $batch);
@@ -1293,6 +1338,37 @@ public function dispatchBroadcast(array $input, AuthenticatedUser $actor): array
         return $this->filterThreadsForPermission($this->completedThreads($limit), $user, $permission, 'concluidos');
     }
 
+    public function searchCompletedForUser(AuthenticatedUser $user, string $search, int $limit = 80): array
+    {
+        $search = trim(mb_strtolower($search));
+        if ($search === '') {
+            return [];
+        }
+
+        $permission = $this->resolveUserPermission($user);
+        if (!$permission['can_view_completed']) {
+            return [];
+        }
+
+        $threads = $this->decorateThreads($this->threads->searchClosed($search, $limit));
+        return $this->filterThreadsForPermission($threads, $user, $permission, 'concluidos');
+    }
+
+    public function completedCount(): int
+    {
+        $now = time();
+        if (isset($this->completedCountCache['ts'], $this->completedCountCache['value'])
+            && ($this->completedCountCache['ts'] >= $now - 30)
+            && is_int($this->completedCountCache['value'])) {
+            return $this->completedCountCache['value'];
+        }
+
+        $count = $this->threads->countClosed();
+        $this->completedCountCache = ['ts' => $now, 'value' => $count];
+
+        return $count;
+    }
+
     public function canForward(AuthenticatedUser $user): bool
     {
         $permission = $this->resolveUserPermission($user);
@@ -1389,6 +1465,11 @@ public function dispatchBroadcast(array $input, AuthenticatedUser $actor): array
             return null;
         }
 
+        $snapshot = $this->extractContactSnapshot($contact);
+        if ($snapshot !== null) {
+            $contact['gateway_snapshot'] = $snapshot;
+        }
+
         $clientSummary = $thread['contact_client'] ?? null;
         if (is_array($clientSummary)) {
             $contact['client_summary'] = $clientSummary;
@@ -1424,6 +1505,21 @@ public function dispatchBroadcast(array $input, AuthenticatedUser $actor): array
             throw new RuntimeException('Conversa não encontrada.');
         }
 
+        $contact = $this->contacts->find((int)$thread['contact_id']);
+        if ($contact !== null && !empty($contact['metadata']) && is_string($contact['metadata'])) {
+            $decodedMeta = json_decode((string)$contact['metadata'], true);
+            if (is_array($decodedMeta)) {
+                $contact['metadata'] = $decodedMeta;
+            }
+        }
+
+        if ($contact !== null) {
+            $snapshot = $this->extractContactSnapshot($contact);
+            if ($snapshot !== null) {
+                $contact['gateway_snapshot'] = $snapshot;
+            }
+        }
+
         $after = max(0, $afterMessageId);
         $rows = $this->messages->listAfterId($threadId, $after, 100);
         $formatted = [];
@@ -1450,6 +1546,7 @@ public function dispatchBroadcast(array $input, AuthenticatedUser $actor): array
                 'id' => (int)$thread['id'],
                 'unread_count' => (int)($thread['unread_count'] ?? 0),
             ],
+            'contact' => $contact,
             'messages' => $formatted,
             'last_message_id' => $lastId,
         ];
@@ -1496,7 +1593,7 @@ public function dispatchBroadcast(array $input, AuthenticatedUser $actor): array
         return $this->threads->find($threadId);
     }
 
-    public function sendMessage(int $threadId, string $body, AuthenticatedUser $actor, ?UploadedFile $mediaFile = null, ?array $templateSelection = null): array
+    public function sendMessage(int $threadId, string $body, AuthenticatedUser $actor, ?UploadedFile $mediaFile = null, ?array $templateSelection = null, ?array $extraMetadata = null): array
     {
         $thread = $this->threads->find($threadId);
         if ($thread === null) {
@@ -1609,6 +1706,10 @@ public function dispatchBroadcast(array $input, AuthenticatedUser $actor): array
             'raw_response' => $metaDispatch['raw_response'] ?? null,
         ];
 
+        if (is_array($extraMetadata) && $extraMetadata !== []) {
+            $metadataPayload = array_merge($metadataPayload, $extraMetadata);
+        }
+
         if ($mediaMeta !== null) {
             $metadataPayload['media'] = $mediaMeta;
         }
@@ -1634,6 +1735,8 @@ public function dispatchBroadcast(array $input, AuthenticatedUser $actor): array
                 $this->contacts->touchInteraction((int)$contact['id'], $timestamp);
 
                 $updated = $this->messages->find((int)$existingByMeta['id']);
+
+                $this->logOutgoingBackup($contact, $line, $thread, $messageContent, $messageType, $metaDispatch, (int)$existingByMeta['id'], $threadId, $timestamp, $actor);
 
                 return [
                     'message_id' => (int)$existingByMeta['id'],
@@ -1671,6 +1774,8 @@ public function dispatchBroadcast(array $input, AuthenticatedUser $actor): array
 
         $messageRow = $this->messages->find($messageId);
 
+        $this->logOutgoingBackup($contact, $line, $thread, $messageContent, $messageType, $metaDispatch, $messageId, $threadId, $timestamp, $actor);
+
         return [
             'message_id' => $messageId,
             'status' => $status,
@@ -1679,11 +1784,50 @@ public function dispatchBroadcast(array $input, AuthenticatedUser $actor): array
         ];
     }
 
+    private function logOutgoingBackup(array $contact, ?array $line, ?array $thread, string $content, string $messageType, array $metaDispatch, int $messageId, int $threadId, int $timestamp, AuthenticatedUser $actor): void
+    {
+        try {
+            $this->backupGatewayOutgoing([
+                'direction' => 'outgoing',
+                'phone' => digits_only((string)($contact['phone'] ?? '')),
+                'message' => $content,
+                'contact_name' => $contact['name'] ?? null,
+                'timestamp' => $timestamp,
+                'line_label' => $line['label'] ?? ($line['name'] ?? null),
+                'instance' => $metaDispatch['gateway_instance'] ?? ($line['provider'] ?? null),
+                'message_type' => $messageType,
+                'meta_message_id' => $metaDispatch['meta_message_id'] ?? null,
+                'meta' => array_merge($metaDispatch, [
+                    'thread_id' => $threadId,
+                    'message_id' => $messageId,
+                    'actor_id' => $actor->id,
+                ]),
+                'raw' => [
+                    'thread' => $thread,
+                    'line' => $line,
+                    'contact' => [
+                        'id' => $contact['id'] ?? null,
+                        'client_id' => $contact['client_id'] ?? null,
+                    ],
+                ],
+            ]);
+        } catch (Throwable $exception) {
+            AlertService::push('whatsapp.gateway_backup', 'Falha ao salvar backup de saída do WhatsApp.', [
+                'error' => $exception->getMessage(),
+                'thread_id' => $threadId,
+                'message_id' => $messageId,
+            ]);
+        }
+    }
+
     public function startManualConversation(array $input, AuthenticatedUser $actor, bool $enforceDailyLimit = true, bool $failOnGatewayError = false, ?int $blockWindowHours = null): array
     {
         $name = trim((string)($input['contact_name'] ?? $input['name'] ?? ''));
         $phone = digits_only((string)($input['contact_phone'] ?? $input['phone'] ?? ''));
         $message = trim((string)($input['message'] ?? ''));
+        $targetQueue = $this->normalizeQueue((string)($input['initial_queue'] ?? $input['queue'] ?? 'arrival'));
+        $campaignKind = mb_strtolower(trim((string)($input['campaign_kind'] ?? '')));
+        $campaignToken = trim((string)($input['campaign_token'] ?? ''));
 
         if ($phone === '' || strlen($phone) < 8) {
             throw new RuntimeException('Informe um telefone válido.');
@@ -1703,11 +1847,40 @@ public function dispatchBroadcast(array $input, AuthenticatedUser $actor): array
             'last_interaction_at' => now(),
         ]);
 
+        $campaignKey = $this->buildCampaignKey($campaignKind, $campaignToken);
+
+        $windowHours = $blockWindowHours !== null ? max(0.01, min(240, (float)$blockWindowHours)) : $this->altPerNumberWindowHours;
+        $perNumberCount = $this->messages->countOutgoingAltByPhoneSince($phone, time() - (int)round($windowHours * 3600));
+        $perCampaignCount = null;
+        if ($campaignKey !== null && $this->altPerCampaignWindowHours !== null) {
+            $perCampaignCount = $this->messages->countOutgoingByCampaignSince(
+                $campaignKey,
+                time() - (int)round($this->altPerCampaignWindowHours * 3600)
+            );
+        }
+
+        AlertService::push('whatsapp.manual_precheck', 'Pré-checagem de limites antes do envio manual.', [
+            'phone' => $phone,
+            'campaign_key' => $campaignKey,
+            'campaign_kind' => $campaignKind,
+            'per_number_window_h' => $windowHours,
+            'per_number_count' => $perNumberCount,
+            'per_campaign_window_h' => $this->altPerCampaignWindowHours,
+            'per_campaign_count' => $perCampaignCount,
+        ]);
+
         $instanceSlug = $this->sanitizeAltGatewaySlug($input['gateway_instance'] ?? null) ?? $this->defaultAltGatewaySlug();
         $instance = $instanceSlug !== null ? $this->altGatewayInstance($instanceSlug) : null;
         if ($instance === null) {
             throw new RuntimeException('Nenhum gateway alternativo habilitado.');
         }
+
+        AlertService::push('whatsapp.manual_instance', 'Gateway selecionado para envio manual.', [
+            'phone' => $phone,
+            'instance_slug' => $instanceSlug,
+            'instance_base_url' => $instance['base_url'] ?? null,
+            'actor_id' => $actor->id,
+        ]);
 
         $channelId = $this->buildAltChannelId($phone, $instanceSlug);
         $thread = $this->threads->findByChannelId($channelId);
@@ -1722,7 +1895,7 @@ public function dispatchBroadcast(array $input, AuthenticatedUser $actor): array
                 $threadId = $this->threads->create([
                     'contact_id' => (int)$contact['id'],
                     'status' => 'open',
-                    'queue' => 'arrival',
+                    'queue' => $targetQueue,
                     'channel_thread_id' => $channelId,
                     'line_id' => null,
                     'unread_count' => 0,
@@ -1738,7 +1911,7 @@ public function dispatchBroadcast(array $input, AuthenticatedUser $actor): array
         } else {
             $this->threads->update((int)$thread['id'], [
                 'status' => 'open',
-                'queue' => 'arrival',
+                'queue' => $targetQueue,
                 'closed_at' => null,
                 'channel_thread_id' => $channelId,
             ]);
@@ -1754,7 +1927,14 @@ public function dispatchBroadcast(array $input, AuthenticatedUser $actor): array
         }
 
         if ($enforceDailyLimit) {
-            $this->enforceAltWindowLimit($phone, $blockWindowHours ?? 24);
+            $this->enforceAltWindowLimit($phone, $blockWindowHours);
+        }
+
+        if ($campaignKey !== null) {
+            $customMessage = $campaignKind === 'birthday'
+                ? 'Felicitações já foram enviadas para este CPF nas últimas 24h.'
+                : null;
+            $this->enforcePerCampaignLimit($campaignKey, $customMessage);
         }
 
         // Anti-duplicação: evita duplo clique imediato (janela curta) para o mesmo contato.
@@ -1778,7 +1958,25 @@ public function dispatchBroadcast(array $input, AuthenticatedUser $actor): array
             }
         }
 
-        $result = $this->sendMessage((int)$thread['id'], $message, $actor);
+        $extraMeta = $campaignKey !== null ? ['campaign_key' => $campaignKey, 'campaign_kind' => $campaignKind] : null;
+        $result = $this->sendMessage((int)$thread['id'], $message, $actor, null, null, $extraMeta);
+
+        AlertService::push('whatsapp.manual_dispatch', 'Envio manual disparado.', [
+            'thread_id' => $result['thread_id'] ?? null,
+            'message_id' => $result['message_id'] ?? null,
+            'status' => $result['status'] ?? null,
+            'gateway_instance' => $instanceSlug,
+            'phone' => $phone,
+            'channel_thread_id' => $channelId,
+        ]);
+
+        AlertService::push('whatsapp.manual_sent', 'Mensagem manual enviada via gateway alternativo.', [
+            'thread_id' => $result['thread_id'] ?? null,
+            'message_id' => $result['message_id'] ?? null,
+            'status' => $result['status'] ?? null,
+            'campaign_key' => $campaignKey,
+            'gateway_instance' => $instanceSlug,
+        ]);
 
         if ($failOnGatewayError && ($result['status'] ?? null) === 'error') {
             $error = 'Falha ao enviar mensagem.';
@@ -1909,8 +2107,29 @@ public function dispatchBroadcast(array $input, AuthenticatedUser $actor): array
                         'meta_message_id' => $message['id'] ?? null,
                         'timestamp' => isset($message['timestamp']) ? (int)$message['timestamp'] : null,
                         'profile' => $value['contacts'][0]['profile']['name'] ?? null,
+                        'profile_photo' => $value['contacts'][0]['profile']['photo'] ?? ($value['contacts'][0]['profile']['picture'] ?? null),
                         'line' => $this->lineFromWebhookValue($value),
                     ];
+
+                    $line = is_array($metadata['line'] ?? null) ? $metadata['line'] : null;
+                    try {
+                        $this->backupGatewayIncoming([
+                            'phone' => digits_only($from),
+                            'direction' => 'incoming',
+                            'message' => $text,
+                            'contact_name' => $metadata['profile'] ?? null,
+                            'timestamp' => $metadata['timestamp'] ?? null,
+                            'line_label' => $line['label'] ?? ($line['name'] ?? null),
+                            'instance' => $line['provider'] ?? null,
+                            'meta' => $metadata,
+                            'raw' => $message,
+                        ]);
+                    } catch (Throwable $exception) {
+                        AlertService::push('whatsapp.gateway_backup', 'Falha ao salvar backup de entrada do webhook.', [
+                            'error' => $exception->getMessage(),
+                            'phone' => $from,
+                        ]);
+                    }
 
                     $this->registerIncomingMessage($from, $text, $metadata);
                     $processed++;
@@ -2015,6 +2234,7 @@ public function dispatchBroadcast(array $input, AuthenticatedUser $actor): array
             'metadata' => $extras,
             'media' => $mediaMeta,
             'message_type' => $messageType,
+            'profile_photo' => $this->resolveProfilePhoto($entry, $extras),
         ];
 
         if ($meta['meta_message_id'] === null) {
@@ -2164,6 +2384,80 @@ public function dispatchBroadcast(array $input, AuthenticatedUser $actor): array
         }
     }
 
+    public function refreshContactProfilePhotos(int $limit = 50, int $maxAgeSeconds = 604800): array
+    {
+        $limit = max(1, $limit);
+        $maxAgeSeconds = max(60, $maxAgeSeconds);
+        $threshold = time() - $maxAgeSeconds;
+
+        $candidates = $this->contacts->listForSnapshotRefresh($threshold, $limit);
+        $updated = 0;
+        $skipped = 0;
+        $errors = [];
+
+        foreach ($candidates as $contact) {
+            $contactId = (int)($contact['id'] ?? 0);
+            if ($contactId <= 0) {
+                $skipped++;
+                continue;
+            }
+
+            $meta = [];
+            if (!empty($contact['metadata']) && is_string($contact['metadata'])) {
+                $decoded = json_decode((string)$contact['metadata'], true);
+                if (is_array($decoded)) {
+                    $meta = $decoded;
+                }
+            }
+
+            $snapshot = isset($meta['gateway_snapshot']) && is_array($meta['gateway_snapshot']) ? $meta['gateway_snapshot'] : null;
+            if ($snapshot === null) {
+                $skipped++;
+                continue;
+            }
+
+            $photoUrl = isset($snapshot['profile_photo']) && is_string($snapshot['profile_photo']) ? trim($snapshot['profile_photo']) : '';
+            if ($photoUrl === '' || !(str_starts_with($photoUrl, 'http://') || str_starts_with($photoUrl, 'https://'))) {
+                $skipped++;
+                continue;
+            }
+
+            $ctx = stream_context_create([
+                'http' => ['timeout' => 6],
+                'https' => ['timeout' => 6],
+            ]);
+
+            $binary = @file_get_contents($photoUrl, false, $ctx);
+            if ($binary === false) {
+                $errors[] = ['contact_id' => $contactId, 'error' => 'fetch_failed'];
+                continue;
+            }
+
+            $etag = sha1($binary);
+            $snapshot['profile_photo_etag'] = $etag;
+            $snapshot['captured_at'] = time();
+            $meta['gateway_snapshot'] = $snapshot;
+            $meta['gateway_snapshot_at'] = $snapshot['captured_at'];
+
+            if (empty($meta['profile_photo'])) {
+                $meta['profile_photo'] = $snapshot['profile_photo'];
+            }
+
+            $this->contacts->update($contactId, [
+                'metadata' => json_encode($meta, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
+            ]);
+
+            $updated++;
+        }
+
+        return [
+            'scanned' => count($candidates),
+            'updated' => $updated,
+            'skipped' => $skipped,
+            'errors' => $errors,
+        ];
+    }
+
     public function registerGatewayAck(string $phone, array $meta): array
     {
         $messageId = trim((string)($meta['meta_message_id'] ?? ''));
@@ -2214,12 +2508,27 @@ public function dispatchBroadcast(array $input, AuthenticatedUser $actor): array
         $contactName = trim((string)($context['contact_name'] ?? 'cliente'));
         $lastMessage = trim((string)($context['last_message'] ?? ''));
         $tone = (string)($context['tone'] ?? 'consultivo');
-        $goal = (string)($context['goal'] ?? 'avançar na venda');
+        $goal = (string)($context['goal'] ?? 'avancar na venda');
         $threadId = isset($context['thread_id']) ? (int)$context['thread_id'] : null;
 
         $profile = $profileId !== null ? $this->copilotProfile($profileId) : null;
         if ($profile === null) {
             $profile = $this->profiles->findDefault();
+        }
+
+        $cacheKey = sha1(implode('|', [
+            $contactName,
+            $lastMessage,
+            $tone,
+            $goal,
+            (string)$threadId,
+            (string)($profile['id'] ?? 'default'),
+        ]));
+        $now = time();
+        if ($this->copilotSuggestionCache['key'] === $cacheKey
+            && ($this->copilotSuggestionCache['ts'] ?? 0) >= $now - self::COPILOT_SUGGESTION_CACHE_TTL
+            && $this->copilotSuggestionCache['data'] !== null) {
+            return $this->copilotSuggestionCache['data'];
         }
 
         if ($profile !== null) {
@@ -2267,7 +2576,9 @@ public function dispatchBroadcast(array $input, AuthenticatedUser $actor): array
         ];
 
         if ($apiKey === '') {
-            return $this->buildRuleBasedSuggestion($contactName, $tone, $goal, $profile, $sentiment, $knowledgeStats);
+            $fallback = $this->buildRuleBasedSuggestion($contactName, $tone, $goal, $profile, $sentiment, $knowledgeStats);
+            $this->copilotSuggestionCache = ['ts' => $now, 'key' => $cacheKey, 'data' => $fallback];
+            return $fallback;
         }
 
         $systemPrompt = $this->buildSystemPrompt($tone, $goal, $profile);
@@ -2284,7 +2595,7 @@ public function dispatchBroadcast(array $input, AuthenticatedUser $actor): array
             $userPromptParts[] = 'Fila atual: ' . ($thread['queue'] ?? 'arrival');
         }
         if ($lastMessage !== '') {
-            $userPromptParts[] = 'Última mensagem do cliente: ' . $lastMessage;
+            $userPromptParts[] = 'Ultima mensagem do cliente: ' . $lastMessage;
         }
 
         $prompt = implode("
@@ -2319,7 +2630,7 @@ Produza uma única resposta curta, mantendo o tom solicitado e convidando o clie
         $temperature = $profile !== null ? (float)$profile['temperature'] : 0.5;
         $response = $this->requestCopilotCompletion($apiKey, $payloadMessages, $temperature);
         if (($response['success'] ?? false) && trim((string)($response['message'] ?? '')) !== '') {
-            return [
+            $result = [
                 'suggestion' => trim((string)$response['message']),
                 'confidence' => $this->confidenceFromSignals($sentiment, $knowledgeStats),
                 'sentiment' => $sentiment,
@@ -2331,6 +2642,8 @@ Produza uma única resposta curta, mantendo o tom solicitado e convidando o clie
                 ] : null,
                 'knowledge' => $knowledgeStats,
             ];
+            $this->copilotSuggestionCache = ['ts' => $now, 'key' => $cacheKey, 'data' => $result];
+            return $result;
         }
 
         if (!empty($response['error'])) {
@@ -2339,7 +2652,10 @@ Produza uma única resposta curta, mantendo o tom solicitado e convidando o clie
             ]);
         }
 
-        return $this->buildRuleBasedSuggestion($contactName, $tone, $goal, $profile, $sentiment, $knowledgeStats);
+        $fallback = $this->buildRuleBasedSuggestion($contactName, $tone, $goal, $profile, $sentiment, $knowledgeStats);
+        $this->copilotSuggestionCache = ['ts' => $now, 'key' => $cacheKey, 'data' => $fallback];
+
+        return $fallback;
     }
 
 
@@ -2814,6 +3130,103 @@ Produza uma única resposta curta, mantendo o tom solicitado e convidando o clie
         $metaMessageId = trim((string)($meta['meta_message_id'] ?? ''));
         $ackValue = $this->coerceAckValue($metaExtras['ack'] ?? null);
 
+        // Normaliza telefone para evitar salvar IDs de contato no lugar do numero.
+        $mappedPhone = $this->mapAltJidToPhone($phone, $metaExtras);
+        $normalizedPhone = $mappedPhone !== null ? $mappedPhone : $phone;
+        if (!str_starts_with($phone, 'group:')) {
+            $rawCandidates = [
+                $phone,
+                $metaExtras['contact_phone'] ?? null,
+                $meta['contact_phone'] ?? null,
+                $meta['phone'] ?? null,
+                $meta['contact'] ?? null,
+                $meta['from'] ?? null,
+                $meta['sender'] ?? null,
+                $meta['sender_id'] ?? null,
+                $meta['id'] ?? null,
+                $meta['channel_thread_id'] ?? null,
+                $meta['contact_id'] ?? null,
+                $meta['contactId'] ?? null,
+                $meta['chat_id'] ?? null,
+                $meta['chatId'] ?? null,
+                $metaExtras['jid'] ?? null,
+                $metaExtras['from'] ?? null,
+                $metaExtras['sender'] ?? null,
+                $metaExtras['sender_id'] ?? null,
+                $metaExtras['id'] ?? null,
+                $metaExtras['contact_id'] ?? null,
+                $metaExtras['contactId'] ?? null,
+                $metaExtras['remote_jid'] ?? null,
+                $metaExtras['remoteJid'] ?? null,
+                $metaExtras['remote'] ?? null,
+                $metaExtras['chat_id'] ?? null,
+                $metaExtras['chatId'] ?? null,
+                $metaExtras['wa_id'] ?? null,
+                $metaExtras['waId'] ?? null,
+                $metaExtras['wid'] ?? null,
+                $metaExtras['whatsapp_id'] ?? null,
+            ];
+
+            $candidates = [];
+            foreach ($rawCandidates as $raw) {
+                if ($raw === null || $raw === '') {
+                    continue;
+                }
+
+                $mapped = $this->mapAltJidToPhone((string)$raw, $metaExtras);
+                if ($mapped !== null) {
+                    $raw = $mapped;
+                }
+
+                if (is_string($raw) && str_contains((string)$raw, '@lid')) {
+                    continue;
+                }
+
+                $digits = digits_only((string)$raw);
+                if ($digits === '') {
+                    continue;
+                }
+
+                $lenDigits = strlen($digits);
+                if ($lenDigits > 15) {
+                    continue;
+                }
+
+                if (!str_starts_with($digits, '55') && $lenDigits >= 10 && $lenDigits <= 11) {
+                    $digits = '55' . $digits;
+                }
+
+                $candidates[] = $digits;
+            }
+
+            if ($candidates !== []) {
+                $unique = array_values(array_unique($candidates));
+                $best = array_reduce($unique, static function ($carry, $item) {
+                    if ($carry === null) {
+                        return $item;
+                    }
+
+                    $lenCarry = strlen($carry);
+                    $lenItem = strlen($item);
+
+                    if (str_starts_with($item, '55') && !str_starts_with($carry, '55')) {
+                        return $item;
+                    }
+
+                    if ($lenItem > $lenCarry) {
+                        return $item;
+                    }
+
+                    return $carry;
+                }, null);
+
+                if ($best !== null) {
+                    $normalizedPhone = $best;
+                }
+            }
+        }
+        $phone = $normalizedPhone;
+
         if ($metaMessageId !== '') {
             $existingByMeta = $this->messages->findByMetaMessageId($metaMessageId);
             if ($existingByMeta !== null) {
@@ -2868,26 +3281,82 @@ Produza uma única resposta curta, mantendo o tom solicitado e convidando o clie
         $line = $meta['line'] ?? null;
         $lineId = $line['id'] ?? null;
 
-        $thread = $lineId !== null
-            ? $this->threads->findLatestByContactAndLine((int)$contact['id'], (int)$lineId)
-            : $this->threads->findLatestByContact((int)$contact['id']);
+        $gatewayInstance = null;
+        $channelValue = '';
+        if (isset($meta['channel_thread_id']) && is_string($meta['channel_thread_id'])) {
+            $channelValue = trim((string)$meta['channel_thread_id']);
+        }
+        if (isset($metaExtras['gateway_instance']) && is_string($metaExtras['gateway_instance'])) {
+            $gatewayInstance = $this->sanitizeAltGatewaySlug((string)$metaExtras['gateway_instance']);
+        } elseif (isset($meta['gateway_instance']) && is_string($meta['gateway_instance'])) {
+            $gatewayInstance = $this->sanitizeAltGatewaySlug((string)$meta['gateway_instance']);
+        }
+
+        $thread = null;
+        if ($channelValue !== '') {
+            $thread = $this->threads->findByChannelId($channelValue);
+        }
+        if ($thread === null) {
+            $thread = $lineId !== null
+                ? $this->threads->findLatestByContactAndLine((int)$contact['id'], (int)$lineId)
+                : $this->threads->findLatestByContact((int)$contact['id']);
+        }
+
+        if ($thread === null && $gatewayInstance !== null) {
+            $channelValue = $this->buildAltChannelId((string)$contact['phone'], $gatewayInstance);
+            $thread = $this->threads->findByChannelId($channelValue);
+        }
+
+        if ($channelValue === '') {
+            $channelValue = $gatewayInstance !== null
+                ? $this->buildAltChannelId((string)$contact['phone'], $gatewayInstance)
+                : 'contact:' . $contact['phone'];
+        }
 
         if ($thread === null) {
-            $threadId = $this->threads->create([
-                'contact_id' => (int)$contact['id'],
-                'status' => 'open',
-                'queue' => 'arrival',
-                'channel_thread_id' => 'contact:' . $contact['phone'],
-                'line_id' => $lineId,
-                'chat_type' => $isGroupChat ? 'group' : 'direct',
-                'group_subject' => $isGroupChat ? $groupSubject : null,
-                'group_metadata' => $isGroupChat ? $groupMetadata : null,
-            ]);
-            $thread = $this->threads->find($threadId);
+            try {
+                $threadId = $this->threads->create([
+                    'contact_id' => (int)$contact['id'],
+                    'status' => 'open',
+                    'queue' => 'arrival',
+                    'channel_thread_id' => $channelValue,
+                    'line_id' => $lineId,
+                    'chat_type' => $isGroupChat ? 'group' : 'direct',
+                    'group_subject' => $isGroupChat ? $groupSubject : null,
+                    'group_metadata' => $isGroupChat ? $groupMetadata : null,
+                ]);
+                $thread = $this->threads->find($threadId);
+            } catch (PDOException $exception) {
+                if (!$this->isUniqueConstraintViolation($exception)) {
+                    throw $exception;
+                }
+                // Outra thread já usa o mesmo canal; reaproveita para evitar 500 no webhook.
+                $existing = $this->threads->findByChannelId($channelValue);
+                if ($existing !== null) {
+                    $thread = $existing;
+                }
+            }
         }
 
         if ($thread === null) {
             throw new RuntimeException('Falha ao gerar conversa para o contato.');
+        }
+
+        // Garante que o channel_thread_id acompanhe o valor do gateway, se disponível.
+        if ($channelValue !== '' && (string)($thread['channel_thread_id'] ?? '') !== $channelValue) {
+            try {
+                $this->threads->update((int)$thread['id'], ['channel_thread_id' => $channelValue]);
+                $thread['channel_thread_id'] = $channelValue;
+            } catch (PDOException $exception) {
+                if (!$this->isUniqueConstraintViolation($exception)) {
+                    throw $exception;
+                }
+                $existing = $this->threads->findByChannelId($channelValue);
+                if ($existing !== null) {
+                    $thread = $existing;
+                    $contact = $this->contacts->find((int)($thread['contact_id'] ?? 0)) ?? $contact;
+                }
+            }
         }
 
         if ($isGroupChat) {
@@ -3113,7 +3582,19 @@ Produza uma única resposta curta, mantendo o tom solicitado e convidando o clie
 
         $fromNormalized = $this->selectIncomingPhone($from, $gatewayMeta);
         $normalizedFrom = digits_only($fromNormalized);
-        if ($normalizedFrom !== '' && $this->isBlockedNumber($normalizedFrom)) {
+        if ($normalizedFrom === '' && isset($metadata['channel_thread_id'])) {
+            [, $channelPhone] = $this->parseAltChannelId((string)$metadata['channel_thread_id']);
+            if ($channelPhone !== null && $channelPhone !== '') {
+                $normalizedFrom = digits_only($channelPhone);
+            }
+        }
+
+        if ($normalizedFrom === '') {
+            $this->logInboundMissingPhone($from, $gatewayMeta, $metadata);
+            return null;
+        }
+
+        if ($this->isBlockedNumber($normalizedFrom)) {
             $this->logBlockedInbound($normalizedFrom, $text, $metadata);
             return 0; // indica bloqueado, mas evita erro no gateway
         }
@@ -3122,7 +3603,12 @@ Produza uma única resposta curta, mantendo o tom solicitado e convidando o clie
         $groupSubject = null;
         $groupMetadata = null;
 
-        if (($gatewayMeta['chat_type'] ?? '') === 'group' || str_starts_with($from, 'group:')) {
+        $remoteJid = (string)($gatewayMeta['remote_jid'] ?? $gatewayMeta['remoteJid'] ?? $gatewayMeta['chat_id'] ?? $gatewayMeta['chatId'] ?? '');
+        $channelThreadIdMeta = (string)($gatewayMeta['channel_thread_id'] ?? '');
+        $looksLikeGroupJid = $remoteJid !== '' && (str_contains($remoteJid, '@g.us') || str_contains($remoteJid, '-'));
+        $looksLikeGroupChannel = $channelThreadIdMeta !== '' && str_starts_with($channelThreadIdMeta, 'group:');
+
+        if (($gatewayMeta['chat_type'] ?? '') === 'group' || str_starts_with($from, 'group:') || $looksLikeGroupJid || $looksLikeGroupChannel) {
             $chatType = 'group';
             $subjectHint = trim((string)($gatewayMeta['group_subject'] ?? $metadata['profile'] ?? ''));
             $groupSubject = $subjectHint !== '' ? $subjectHint : 'Grupo WhatsApp';
@@ -3155,7 +3641,7 @@ Produza uma única resposta curta, mantendo o tom solicitado e convidando o clie
         }
 
         $profileName = (string)($metadata['profile'] ?? '');
-        $profilePhoto = isset($metadata['profile_photo']) ? (string)$metadata['profile_photo'] : null;
+        $profilePhoto = $this->resolveProfilePhoto($metadata, $gatewayMeta);
         if ($profilePhoto !== null && !str_starts_with($profilePhoto, 'http')) {
             $profilePhoto = null;
         }
@@ -3188,17 +3674,25 @@ Produza uma única resposta curta, mantendo o tom solicitado e convidando o clie
 
         $mergedMeta = array_filter(array_merge($existingMeta, $contactMetadata), static fn($value) => $value !== null && $value !== '');
 
-        $needsSnapshotRefresh = $existingSnapshot === null || ($timestamp - $existingSnapshotAt) > self::GATEWAY_SNAPSHOT_TTL;
-        if ($needsSnapshotRefresh) {
-            $snapshot = [
-                'name' => $profileName !== '' ? $profileName : ($existingSnapshot['name'] ?? null),
-                'phone' => $normalizedFrom,
-                'profile_photo' => $profilePhoto ?: ($existingSnapshot['profile_photo'] ?? null),
-                'source' => $metadata['origin'] ?? ($existingSnapshot['source'] ?? 'whatsapp'),
-                'meta_message_id' => $metadata['meta_message_id'] ?? ($metadata['message_id'] ?? null),
-                'captured_at' => $timestamp,
-            ];
-            $mergedMeta['gateway_snapshot'] = array_filter($snapshot, static fn($value) => $value !== null && $value !== '');
+        $snapshot = $this->buildGatewaySnapshot(
+            $metadata,
+            $gatewayMeta,
+            $normalizedFrom,
+            $profileName,
+            $profilePhoto,
+            $timestamp,
+            $chatType,
+            $groupSubject,
+            $groupMetadata,
+            is_array($existingSnapshot) ? $existingSnapshot : null
+        );
+
+        $needsSnapshotRefresh = ($existingSnapshot === null)
+            || ($timestamp - $existingSnapshotAt) > self::GATEWAY_SNAPSHOT_TTL
+            || $this->gatewaySnapshotChanged($existingSnapshot, $snapshot);
+
+        if ($snapshot !== null && $needsSnapshotRefresh) {
+            $mergedMeta['gateway_snapshot'] = $snapshot;
             $mergedMeta['gateway_snapshot_at'] = $timestamp;
         }
 
@@ -3254,6 +3748,12 @@ Produza uma única resposta curta, mantendo o tom solicitado e convidando o clie
             ? $this->threads->findLatestByContactAndLine((int)$contact['id'], (int)$lineId)
             : $this->threads->findLatestByContact((int)$contact['id']);
 
+        // Safety net: if the line changed or was renamed, still reuse the most recent thread for the contact
+        // before creating a new one. This avoids duplicate threads when the gateway switches line metadata.
+        if ($thread === null && $lineId !== null) {
+            $thread = $this->threads->findLatestByContact((int)$contact['id']);
+        }
+
         $channelValue = $isAltGateway
             ? $this->buildAltChannelId((string)$contact['phone'], $altInstanceSlug)
             : 'contact:' . $contact['phone'];
@@ -3293,6 +3793,7 @@ Produza uma única resposta curta, mantendo o tom solicitado e convidando o clie
             return null;
         }
 
+        // Keep channel id consistent for alt gateway threads; also reuse existing channel ids when possible.
         if ($isAltGateway) {
             $channelId = (string)($thread['channel_thread_id'] ?? '');
             $needsChannelUpdate = $channelId === '' || $channelId !== $channelValue || !str_starts_with($channelId, 'alt:');
@@ -3301,6 +3802,37 @@ Produza uma única resposta curta, mantendo o tom solicitado e convidando o clie
                     $this->threads->update((int)$thread['id'], [
                         'channel_thread_id' => $channelValue,
                     ]);
+                    $thread['channel_thread_id'] = $channelValue;
+                } catch (PDOException $exception) {
+                    if (!$this->isUniqueConstraintViolation($exception)) {
+                        throw $exception;
+                    }
+
+                    $existingThread = $this->threads->findByChannelId($channelValue);
+                    if ($existingThread !== null) {
+                        $thread = $existingThread;
+                        $linkedContactId = (int)($thread['contact_id'] ?? 0);
+                        if ($linkedContactId > 0 && $linkedContactId !== (int)$contact['id']) {
+                            $resolvedContact = $this->contacts->find($linkedContactId);
+                            if (is_array($resolvedContact)) {
+                                $contact = $resolvedContact;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // If we reused an older thread that lacked a line_id, attach the current line to avoid future splits.
+            if ($lineId !== null && ((int)($thread['line_id'] ?? 0)) !== (int)$lineId) {
+                $this->threads->update((int)$thread['id'], ['line_id' => (int)$lineId]);
+                $thread['line_id'] = (int)$lineId;
+            }
+        } else {
+            // Meta/default gateway: alinhar channel_thread_id ao contato para evitar threads paralelas por linha.
+            $channelId = (string)($thread['channel_thread_id'] ?? '');
+            if ($channelId === '' || $channelId !== $channelValue) {
+                try {
+                    $this->threads->update((int)$thread['id'], ['channel_thread_id' => $channelValue]);
                     $thread['channel_thread_id'] = $channelValue;
                 } catch (PDOException $exception) {
                     if (!$this->isUniqueConstraintViolation($exception)) {
@@ -3349,10 +3881,14 @@ Produza uma única resposta curta, mantendo o tom solicitado e convidando o clie
                 'queue' => 'arrival',
                 'assigned_user_id' => null,
                 'closed_at' => null,
+                'line_id' => $lineId !== null ? (int)$lineId : $thread['line_id'] ?? null,
             ]);
             $thread['status'] = 'open';
             $thread['queue'] = 'arrival';
             $thread['assigned_user_id'] = null;
+            if ($lineId !== null) {
+                $thread['line_id'] = (int)$lineId;
+            }
         }
 
         $isGroup = (($thread['chat_type'] ?? 'direct') === 'group');
@@ -3383,17 +3919,60 @@ Produza uma única resposta curta, mantendo o tom solicitado e convidando o clie
         $messageMeta['message_type'] = $messageType;
 
         $metaMessageId = isset($metadata['meta_message_id']) ? trim((string)$metadata['meta_message_id']) : '';
-        $existingMessage = $metaMessageId !== '' ? $this->messages->findByMetaMessageId($metaMessageId) : null;
+        $existingMessage = null;
+        $dedupeWindow = null;
+        $dedupeEnabled = filter_var(env('WHATSAPP_DEDUPE_ENABLED', true), FILTER_VALIDATE_BOOL);
+
+        if ($dedupeEnabled && $metaMessageId !== '') {
+            $existingMessage = $this->messages->findByMetaMessageId($metaMessageId);
+        }
+
+        if ($dedupeEnabled && $existingMessage === null) {
+            $dedupeWindow = $isHistoryEvent
+                ? (int)max(60, env('WHATSAPP_HISTORY_DEDUPE_WINDOW', 86400))
+                : (int)max(30, env('WHATSAPP_INCOMING_DEDUPE_WINDOW', 300));
+            $existingMessage = $this->messages->findIncomingDuplicate(
+                (int)$thread['id'],
+                $text,
+                (int)$timestamp,
+                $messageType,
+                $metaMessageId !== '' ? $metaMessageId : null,
+                $dedupeWindow
+            );
+        }
+
         if ($existingMessage !== null) {
-            if ($isHistoryEvent) {
-                return (int)($existingMessage['thread_id'] ?? 0);
-            }
             if (($existingMessage['direction'] ?? '') === 'incoming') {
                 $this->applyIncomingMessageEdit($existingMessage, $thread, $text, $messageMeta);
+
+                $updatePayload = [];
+                if ($metaMessageId !== '' && empty($existingMessage['meta_message_id'])) {
+                    $updatePayload['meta_message_id'] = $metaMessageId;
+                }
+                if ($updatePayload !== []) {
+                    $this->messages->updateIncomingMessage((int)$existingMessage['id'], $updatePayload);
+                }
+
+                $this->logInboundDedupe([
+                    'action' => 'reuse',
+                    'reason' => $metaMessageId !== '' ? 'meta_message_id' : 'content_window',
+                    'dedupe_window' => $dedupeWindow ?? null,
+                    'gateway' => $isAltGateway ? 'alt' : 'meta',
+                    'gateway_slug' => $altInstanceSlug,
+                    'normalized_phone' => $normalizedFrom,
+                    'raw_from' => $from,
+                    'channel_thread_id' => $thread['channel_thread_id'] ?? null,
+                    'thread_id' => $existingMessage['thread_id'] ?? ($thread['id'] ?? null),
+                    'message_id' => $existingMessage['id'] ?? null,
+                    'meta_message_id' => $metaMessageId !== '' ? $metaMessageId : ($existingMessage['meta_message_id'] ?? null),
+                    'message_type' => $messageType,
+                    'history' => $isHistoryEvent,
+                ]);
+
                 return (int)$existingMessage['thread_id'];
             }
 
-            return (int)$existingMessage['thread_id'];
+            return (int)($existingMessage['thread_id'] ?? $thread['id']);
         }
 
         $this->messages->create([
@@ -3405,6 +3984,21 @@ Produza uma única resposta curta, mantendo o tom solicitado e convidando o clie
             'meta_message_id' => $metadata['meta_message_id'] ?? null,
             'metadata' => json_encode($messageMeta, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
             'sent_at' => $timestamp,
+        ]);
+
+        $this->logInboundDedupe([
+            'action' => 'create',
+            'reason' => 'new_message',
+            'dedupe_window' => $dedupeWindow ?? null,
+            'gateway' => $isAltGateway ? 'alt' : 'meta',
+            'gateway_slug' => $altInstanceSlug,
+            'normalized_phone' => $normalizedFrom,
+            'raw_from' => $from,
+            'channel_thread_id' => $thread['channel_thread_id'] ?? null,
+            'thread_id' => $thread['id'] ?? null,
+            'meta_message_id' => $metaMessageId !== '' ? $metaMessageId : null,
+            'message_type' => $messageType,
+            'history' => $isHistoryEvent,
         ]);
 
         $this->messages->pruneToLatest((int)$thread['id'], self::MESSAGE_RETAIN_LIMIT);
@@ -3510,7 +4104,7 @@ Produza uma única resposta curta, mantendo o tom solicitado e convidando o clie
         $parts[] = sprintf('Pré-atendimento IA para %s', $contact);
 
         if ($lastText !== '') {
-            $parts[] = 'Última mensagem: "' . mb_substr($lastText, 0, 180) . '"';
+            $parts[] = 'Ultima mensagem: "' . mb_substr($lastText, 0, 180) . '"';
         }
 
         if ($copilotText !== '') {
@@ -3800,6 +4394,9 @@ Produza uma única resposta curta, mantendo o tom solicitado e convidando o clie
     private function decorateThreads(array $threads): array
     {
         foreach ($threads as &$thread) {
+            $contactId = isset($thread['contact_id']) ? (int)$thread['contact_id'] : 0;
+            $contactRow = $contactId > 0 ? $this->contacts->find($contactId) : null;
+
             $isGroup = (($thread['chat_type'] ?? 'direct') === 'group');
             $thread['is_group'] = $isGroup;
             if ($isGroup && ($thread['queue'] ?? '') !== 'groups') {
@@ -3847,6 +4444,12 @@ Produza uma única resposta curta, mantendo o tom solicitado e convidando o clie
             } else {
                 $thread['contact_client'] = null;
             }
+
+            if ($contactRow !== null) {
+                $thread['contact_snapshot'] = $this->extractContactSnapshot($contactRow);
+            }
+
+            $thread['contact_photo'] = $this->resolveContactPhoto($thread, $contactRow);
 
             $this->applyContactDisplayMetadata($thread);
         }
@@ -3911,6 +4514,76 @@ Produza uma única resposta curta, mantendo o tom solicitado e convidando o clie
 
         $thread['contact_display'] = $name;
         $thread['contact_display_secondary'] = $phone;
+    }
+
+    private function resolveContactPhoto(array $thread, ?array $contactRow = null): ?string
+    {
+        $contactId = isset($thread['contact_id']) ? (int)$thread['contact_id'] : 0;
+        if ($contactId <= 0) {
+            return null;
+        }
+
+        $contact = $contactRow ?? $this->contacts->find($contactId);
+        if (!is_array($contact)) {
+            return null;
+        }
+
+        $meta = [];
+        if (!empty($contact['metadata']) && is_string($contact['metadata'])) {
+            $decoded = json_decode((string)$contact['metadata'], true);
+            if (is_array($decoded)) {
+                $meta = $decoded;
+            }
+        }
+
+        $snapshot = isset($meta['gateway_snapshot']) && is_array($meta['gateway_snapshot']) ? $meta['gateway_snapshot'] : [];
+        $candidates = [
+            $snapshot['profile_photo'] ?? null,
+            $meta['profile_photo'] ?? null,
+            $meta['photo'] ?? null,
+        ];
+
+        foreach ($candidates as $candidate) {
+            if (is_string($candidate) && str_starts_with($candidate, 'http')) {
+                return $candidate;
+            }
+        }
+
+        return null;
+    }
+
+    private function extractContactSnapshot(array $contact): ?array
+    {
+        $meta = [];
+        if (!empty($contact['metadata']) && is_string($contact['metadata'])) {
+            $decoded = json_decode((string)$contact['metadata'], true);
+            if (is_array($decoded)) {
+                $meta = $decoded;
+            }
+        } elseif (is_array($contact['metadata'] ?? null)) {
+            $meta = (array)$contact['metadata'];
+        }
+
+        $snapshot = isset($meta['gateway_snapshot']) && is_array($meta['gateway_snapshot']) ? $meta['gateway_snapshot'] : null;
+        if ($snapshot === null) {
+            return null;
+        }
+
+        $allowed = [
+            'name', 'phone', 'profile_photo', 'profile_photo_etag', 'captured_at', 'source', 'meta_message_id',
+            'wa_id', 'chat_id', 'presence', 'about', 'last_seen_at', 'verified_level', 'verified_name',
+            'is_business', 'business_name', 'business_description', 'business_category', 'business_hours',
+            'group_subject', 'group_metadata', 'group_participants',
+        ];
+
+        $filtered = [];
+        foreach ($allowed as $key) {
+            if (array_key_exists($key, $snapshot)) {
+                $filtered[$key] = $snapshot[$key];
+            }
+        }
+
+        return $filtered === [] ? null : $filtered;
     }
 
     private function resolveThreadClient(array $thread): ?array
@@ -3999,6 +4672,24 @@ Produza uma única resposta curta, mantendo o tom solicitado e convidando o clie
         return false;
     }
 
+    private function normalizeIncomingDigits(string $value): string
+    {
+        $digits = preg_replace('/\D+/', '', $value) ?: '';
+        if ($digits === '') {
+            return '';
+        }
+
+        if ($this->isLikelyPhone($digits) && $this->isValidBrazilDisplayPhone($digits) && !str_starts_with($digits, '55')) {
+            $digits = '55' . $digits;
+        }
+
+        if (strlen($digits) > 15) {
+            $digits = substr($digits, -15);
+        }
+
+        return $digits;
+    }
+
     private function selectIncomingPhone(string $from, array $gatewayMeta): string
     {
         $candidates = [];
@@ -4031,6 +4722,7 @@ Produza uma única resposta curta, mantendo o tom solicitado e convidando o clie
         // Then try well-known sender keys from gateway metadata.
         $keys = [
             'wa_id', 'msisdn', 'phone', 'peer', 'remote', 'remote_jid', 'jid', 'chat_id', 'chatId',
+            'channel_thread_id', 'channel_id', 'conversation_id',
             'from', 'sender', 'sender_id', 'contact', 'contact_phone', 'id',
         ];
         foreach ($keys as $key) {
@@ -4039,16 +4731,26 @@ Produza uma única resposta curta, mantendo o tom solicitado e convidando o clie
             }
         }
 
+        // Parse alt channel id to recover phone if provided as alt:<slug>:<digits>.
+        if (isset($gatewayMeta['channel_thread_id'])) {
+            [$slug, $channelPhone] = $this->parseAltChannelId((string)$gatewayMeta['channel_thread_id']);
+            if ($channelPhone !== null) {
+                $push($channelPhone);
+            }
+        }
+
         // Fallback to the raw `from` parameter last, to avoid line numbers overriding participant phones.
         $push($from);
 
         foreach ($candidates as $candidate) {
             if ($this->isLikelyPhone($candidate['digits'])) {
-                return $candidate['digits'];
+                return $this->normalizeIncomingDigits($candidate['digits']);
             }
         }
 
-        return $candidates[0]['digits'] ?? '';
+        $fallback = $candidates[0]['digits'] ?? '';
+
+        return $fallback !== '' ? $this->normalizeIncomingDigits($fallback) : '';
     }
 
     private function logBlockedInbound(string $phone, string $text, array $metadata): void
@@ -4074,6 +4776,374 @@ Produza uma única resposta curta, mantendo o tom solicitado e convidando o clie
             }
         } catch (\Throwable) {
             // Ignora falhas de log para não afetar o fluxo.
+        }
+    }
+
+    private function logInboundMissingPhone(string $from, array $gatewayMeta, array $metadata): void
+    {
+        try {
+            $payload = [
+                'raw_from' => $from,
+                'gateway_meta_keys' => array_keys($gatewayMeta),
+                'channel_thread_id' => $gatewayMeta['channel_thread_id'] ?? $metadata['channel_thread_id'] ?? null,
+                'meta_message_id' => $metadata['meta_message_id'] ?? null,
+                'timestamp' => $metadata['timestamp'] ?? now(),
+            ];
+
+            $dir = storage_path('logs');
+            if (!is_dir($dir)) {
+                @mkdir($dir, 0775, true);
+            }
+
+            $line = sprintf('[%s] missing_phone %s%s', date('c'), $payload['meta_message_id'] ?? '-', json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+            error_log($line . PHP_EOL, 3, $dir . '/whatsapp_incoming_missing_phone.log');
+        } catch (\Throwable $exception) {
+            // Intencionalmente suprime para não quebrar ingestão.
+        }
+    }
+
+    private function resolveProfilePhoto(array $meta, array $gatewayMeta = []): ?string
+    {
+        $candidates = [];
+
+        $push = static function ($value) use (&$candidates): void {
+            if (is_string($value) && $value !== '') {
+                $candidates[] = $value;
+                return;
+            }
+            if (is_array($value)) {
+                $keys = ['eurl', 'url', 'link', 'full', 'preview', 'picture'];
+                foreach ($keys as $key) {
+                    if (!empty($value[$key]) && is_string($value[$key])) {
+                        $candidates[] = (string)$value[$key];
+                    }
+                }
+            }
+        };
+
+        $push($meta['profile_photo'] ?? null);
+        $push($meta['photo'] ?? null);
+        $push($meta['avatar'] ?? null);
+        $push($meta['picture'] ?? null);
+        $push($meta['profilePicThumbObj'] ?? null);
+
+        $push($gatewayMeta['profile_photo'] ?? null);
+        $push($gatewayMeta['photo'] ?? null);
+        $push($gatewayMeta['avatar'] ?? null);
+        $push($gatewayMeta['picture'] ?? null);
+        $push($gatewayMeta['profilePicThumbObj'] ?? null);
+
+        foreach ($candidates as $candidate) {
+            $url = trim((string)$candidate);
+            if ($url === '') {
+                continue;
+            }
+            if (str_starts_with($url, 'http://') || str_starts_with($url, 'https://')) {
+                return $url;
+            }
+        }
+
+        return null;
+    }
+
+    private function gatewaySnapshotChanged($existingSnapshot, ?array $newSnapshot): bool
+    {
+        if ($newSnapshot === null) {
+            return false;
+        }
+        if (!is_array($existingSnapshot)) {
+            return true;
+        }
+
+        $old = $existingSnapshot;
+        $current = $newSnapshot;
+        unset($old['captured_at'], $current['captured_at']);
+
+        return $old !== $current;
+    }
+
+    private function buildGatewaySnapshot(
+        array $metadata,
+        array $gatewayMeta,
+        string $normalizedFrom,
+        string $profileName,
+        ?string $profilePhoto,
+        int $timestamp,
+        string $chatType,
+        ?string $groupSubject,
+        ?string $groupMetadata,
+        ?array $existingSnapshot
+    ): ?array {
+        $snapshot = is_array($existingSnapshot) ? $existingSnapshot : [];
+        $snapshot['captured_at'] = $timestamp;
+
+        if ($profileName !== '') {
+            $snapshot['name'] = $profileName;
+        }
+        if ($normalizedFrom !== '') {
+            $snapshot['phone'] = $normalizedFrom;
+        }
+        if ($profilePhoto !== null) {
+            $snapshot['profile_photo'] = $profilePhoto;
+        }
+
+        $source = $this->coerceSnapshotString($metadata['origin'] ?? null) ?? ($snapshot['source'] ?? 'whatsapp');
+        $snapshot['source'] = $source;
+
+        $metaMessageId = $this->coerceSnapshotString($metadata['meta_message_id'] ?? ($metadata['message_id'] ?? null));
+        if ($metaMessageId !== null) {
+            $snapshot['meta_message_id'] = $metaMessageId;
+        }
+
+        $snapshot['wa_id'] = $this->coerceSnapshotString($gatewayMeta['wa_id'] ?? $gatewayMeta['waId'] ?? null);
+        $snapshot['chat_id'] = $this->coerceSnapshotString(
+            $gatewayMeta['chat_id'] ?? $gatewayMeta['chatId'] ?? $gatewayMeta['remote_jid'] ?? $gatewayMeta['remoteJid'] ?? null
+        );
+
+        $snapshot['presence'] = $this->normalizePresenceValue(
+            $gatewayMeta['presence'] ?? $gatewayMeta['status_presence'] ?? $metadata['presence'] ?? null
+        );
+        $snapshot['about'] = $this->coerceSnapshotString(
+            $gatewayMeta['about'] ?? $gatewayMeta['status'] ?? $gatewayMeta['status_message'] ?? $metadata['about'] ?? null
+        );
+        $snapshot['last_seen_at'] = $this->coerceSnapshotTimestamp(
+            $gatewayMeta['last_seen'] ?? $gatewayMeta['last_seen_at'] ?? $gatewayMeta['lastSeen'] ?? $gatewayMeta['last_activity'] ?? null
+        );
+
+        $isBusiness = $this->coerceSnapshotBool(
+            $gatewayMeta['is_business'] ?? $gatewayMeta['business'] ?? $gatewayMeta['verified_business'] ?? null
+        );
+        if ($isBusiness !== null) {
+            $snapshot['is_business'] = $isBusiness;
+        }
+
+        $snapshot['business_name'] = $this->coerceSnapshotString(
+            $gatewayMeta['business_name'] ?? $gatewayMeta['verified_name'] ?? $gatewayMeta['businessName'] ?? null
+        );
+        $snapshot['business_description'] = $this->coerceSnapshotString(
+            $gatewayMeta['business_description'] ?? $gatewayMeta['business_profile_description'] ?? null
+        );
+        $snapshot['business_category'] = $this->coerceSnapshotString(
+            $gatewayMeta['business_category'] ?? $gatewayMeta['category'] ?? null
+        );
+        $businessHours = $this->decodeJsonArray($gatewayMeta['business_hours'] ?? $gatewayMeta['businessHours'] ?? null);
+        if ($businessHours !== null) {
+            $snapshot['business_hours'] = $businessHours;
+        }
+
+        $snapshot['verified_level'] = $this->coerceSnapshotString(
+            $gatewayMeta['verified_level'] ?? $gatewayMeta['verification'] ?? null
+        );
+        $snapshot['verified_name'] = $this->coerceSnapshotString(
+            $gatewayMeta['verified_name'] ?? $gatewayMeta['business_name'] ?? null
+        );
+
+        $photoEtag = $this->coerceSnapshotString(
+            $gatewayMeta['profile_photo_id'] ?? $gatewayMeta['photo_id'] ?? $gatewayMeta['photo_hash'] ?? null
+        );
+        if ($photoEtag !== null) {
+            $snapshot['profile_photo_etag'] = $photoEtag;
+        }
+
+        if ($chatType === 'group') {
+            if ($groupSubject !== null && $groupSubject !== '') {
+                $snapshot['group_subject'] = $groupSubject;
+            }
+
+            $groupMetaDecoded = $this->decodeJsonArray($groupMetadata);
+            if ($groupMetaDecoded === null) {
+                $groupMetaDecoded = $this->decodeJsonArray($gatewayMeta['group_metadata'] ?? $gatewayMeta['groupMetadata'] ?? null);
+            }
+            if ($groupMetaDecoded !== null) {
+                $snapshot['group_metadata'] = $groupMetaDecoded;
+            }
+
+            $participants = $this->normalizeGroupParticipants($gatewayMeta);
+            if ($participants !== []) {
+                $snapshot['group_participants'] = $participants;
+            }
+        }
+
+        $cleaned = array_filter($snapshot, static fn($value) => $value !== null && $value !== '' && $value !== []);
+        if (isset($cleaned['group_participants']) && $cleaned['group_participants'] === []) {
+            unset($cleaned['group_participants']);
+        }
+
+        return $cleaned === [] ? null : $cleaned;
+    }
+
+    private function coerceSnapshotString($value): ?string
+    {
+        if (is_string($value)) {
+            $trimmed = trim($value);
+            return $trimmed !== '' ? $trimmed : null;
+        }
+
+        if (is_numeric($value)) {
+            return (string)$value;
+        }
+
+        return null;
+    }
+
+    private function coerceSnapshotBool($value): ?bool
+    {
+        if (is_bool($value)) {
+            return $value;
+        }
+
+        if (is_numeric($value)) {
+            return ((int)$value) !== 0;
+        }
+
+        if (is_string($value)) {
+            $normalized = strtolower(trim($value));
+            if (in_array($normalized, ['true', 'yes', 'sim', '1', 'y'], true)) {
+                return true;
+            }
+            if (in_array($normalized, ['false', 'no', 'nao', 'não', '0', 'n'], true)) {
+                return false;
+            }
+        }
+
+        return null;
+    }
+
+    private function coerceSnapshotTimestamp($value): ?int
+    {
+        if ($value === null || $value === '') {
+            return null;
+        }
+
+        if (is_int($value) || is_float($value)) {
+            $intValue = (int)$value;
+            return $intValue > 0 ? $intValue : null;
+        }
+
+        if (is_numeric($value)) {
+            $intValue = (int)$value;
+            return $intValue > 0 ? $intValue : null;
+        }
+
+        $parsed = strtotime((string)$value);
+        return $parsed !== false ? $parsed : null;
+    }
+
+    private function decodeJsonArray($value): ?array
+    {
+        if (is_array($value)) {
+            return $value;
+        }
+
+        if (is_string($value) && trim($value) !== '') {
+            $decoded = json_decode((string)$value, true);
+            return is_array($decoded) ? $decoded : null;
+        }
+
+        return null;
+    }
+
+    private function normalizeGroupParticipants(array $gatewayMeta, int $limit = 50): array
+    {
+        $sources = [
+            $gatewayMeta['participants'] ?? null,
+            $gatewayMeta['group_participants'] ?? null,
+            $gatewayMeta['groupParticipants'] ?? null,
+        ];
+
+        $groupMetaDecoded = $this->decodeJsonArray($gatewayMeta['group_metadata'] ?? $gatewayMeta['groupMetadata'] ?? null);
+        if (is_array($groupMetaDecoded) && isset($groupMetaDecoded['participants'])) {
+            $sources[] = $groupMetaDecoded['participants'];
+        }
+
+        $participants = [];
+        foreach ($sources as $source) {
+            if (!is_array($source)) {
+                continue;
+            }
+
+            foreach ($source as $entry) {
+                if (!is_array($entry)) {
+                    continue;
+                }
+
+                $participant = [];
+
+                $name = $this->coerceSnapshotString($entry['name'] ?? $entry['pushname'] ?? $entry['display'] ?? null);
+                if ($name !== null) {
+                    $participant['name'] = $name;
+                }
+
+                $rawPhone = $entry['phone'] ?? $entry['id'] ?? $entry['jid'] ?? $entry['participant'] ?? null;
+                $phoneDigits = $rawPhone !== null ? digits_only((string)$rawPhone) : '';
+                if ($phoneDigits !== '') {
+                    $participant['phone'] = $phoneDigits;
+                }
+
+                $isAdmin = $this->coerceSnapshotBool($entry['is_admin'] ?? $entry['isAdmin'] ?? $entry['admin'] ?? null);
+                if ($isAdmin !== null) {
+                    $participant['is_admin'] = $isAdmin;
+                }
+
+                $isSuperadmin = $this->coerceSnapshotBool($entry['is_superadmin'] ?? $entry['isSuperAdmin'] ?? $entry['superadmin'] ?? null);
+                if ($isSuperadmin !== null) {
+                    $participant['is_superadmin'] = $isSuperadmin;
+                }
+
+                if ($participant === []) {
+                    continue;
+                }
+
+                $participants[] = $participant;
+
+                if (count($participants) >= $limit) {
+                    break 2;
+                }
+            }
+        }
+
+        return $participants;
+    }
+
+    private function normalizePresenceValue($value): ?string
+    {
+        $string = $this->coerceSnapshotString($value);
+        if ($string === null) {
+            return null;
+        }
+
+        $normalized = strtolower($string);
+        $map = [
+            'available' => 'online',
+            'online' => 'online',
+            'unavailable' => 'offline',
+            'offline' => 'offline',
+            'composing' => 'typing',
+            'recording' => 'recording',
+            'paused' => 'paused',
+        ];
+
+        return $map[$normalized] ?? $normalized;
+    }
+
+    private function logInboundDedupe(array $payload): void
+    {
+        try {
+            $dir = storage_path('logs');
+            if (!is_dir($dir)) {
+                @mkdir($dir, 0777, true);
+            }
+
+            $payload['timestamp'] = $payload['timestamp'] ?? now();
+            $payload['app_env'] = env('APP_ENV', 'local');
+            $payload['app_debug'] = env('APP_DEBUG', false);
+
+            $line = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+            if ($line !== false) {
+                @file_put_contents($dir . DIRECTORY_SEPARATOR . 'whatsapp_dedupe.log', $line . PHP_EOL, FILE_APPEND | LOCK_EX);
+            }
+        } catch (\Throwable) {
+            // Falha de log não deve quebrar o fluxo.
         }
     }
 
@@ -4136,7 +5206,7 @@ Produza uma única resposta curta, mantendo o tom solicitado e convidando o clie
         $now = time();
 
         // Prefer certificates table (protocol column) as ground truth.
-        $certificate = $this->certificates->latestForClient($clientId);
+        $certificate = $this->certificateService->latestForCustomer($clientId);
         if ($certificate) {
             $protocolNumber = (string)($certificate['protocol'] ?? '');
             $endAt = isset($certificate['end_at']) ? (int)$certificate['end_at'] : null;
@@ -4377,6 +5447,19 @@ Produza uma única resposta curta, mantendo o tom solicitado e convidando o clie
         }
 
         $raw = config('whatsapp_alt_gateways', []);
+        $this->altGatewayDailyLimitDefault = max(0, (int)($raw['default_daily_limit'] ?? 0));
+        $this->altGatewayRotationWindowHours = max(1, (int)($raw['rotation_window_hours'] ?? 24));
+
+        $perNumberHours = (float)($raw['per_number_window_hours'] ?? 24);
+        $this->altPerNumberWindowHours = $perNumberHours > 0 ? min(240.0, $perNumberHours) : 0.01;
+        $this->altPerNumberLimit = max(1, (int)($raw['per_number_limit'] ?? 1));
+
+        $perCampaignHours = $raw['per_campaign_window_hours'] ?? null;
+        $perCampaignLimit = $raw['per_campaign_limit'] ?? null;
+        $this->altPerCampaignWindowHours = $perCampaignHours !== null
+            ? max(0.01, min(240.0, (float)$perCampaignHours))
+            : null;
+        $this->altPerCampaignLimit = $perCampaignLimit !== null ? max(1, (int)$perCampaignLimit) : null;
         $instances = [];
         $rawInstances = is_array($raw['instances'] ?? null) ? $raw['instances'] : [];
         $default = isset($raw['default_instance']) ? $this->sanitizeAltGatewaySlug($raw['default_instance']) : null;
@@ -4418,6 +5501,10 @@ Produza uma única resposta curta, mantendo o tom solicitado e convidando o clie
         $startCommand = trim((string)($config['start_command'] ?? ''));
         $defaultLine = trim((string)($config['default_line_label'] ?? 'WhatsApp Web Alternativo'));
         $sessionHint = trim((string)($config['session_hint'] ?? ''));
+        $dailyLimit = array_key_exists('daily_limit', $config)
+            ? (int)$config['daily_limit']
+            : $this->altGatewayDailyLimitDefault;
+        $dailyLimit = max(0, $dailyLimit);
         $enabled = array_key_exists('enabled', $config) ? (bool)$config['enabled'] : true;
 
         if ($enabled === false) {
@@ -4434,6 +5521,7 @@ Produza uma única resposta curta, mantendo o tom solicitado e convidando o clie
             'webhook_token' => trim((string)($config['webhook_token'] ?? '')),
             'default_line_label' => $defaultLine,
             'session_hint' => $sessionHint,
+            'daily_limit' => $dailyLimit,
             'enabled' => $enabled,
         ];
     }
@@ -4540,18 +5628,133 @@ Produza uma única resposta curta, mantendo o tom solicitado e convidando o clie
         return 'alt:' . $slug . ':' . $digits;
     }
 
-    private function enforceAltDailyLimit(string $phone): void
+    private function mapAltJidToPhone(string $raw, array $meta = []): ?string
     {
-        $this->enforceAltWindowLimit($phone, 24);
+        $map = config('whatsapp_alt_jid_map', []);
+        if (!is_array($map) || $map === []) {
+            return null;
+        }
+
+        $candidates = [$raw];
+        $digitsRaw = preg_replace('/\D+/', '', $raw) ?: '';
+        if ($digitsRaw !== '') {
+            $candidates[] = $digitsRaw;
+        }
+
+        $messageId = (string)($meta['meta_message_id'] ?? ($meta['message_id'] ?? ''));
+        $chatId = (string)($meta['chat_id'] ?? ($meta['chatId'] ?? ''));
+        if ($messageId !== '') {
+            $candidates[] = $messageId;
+        }
+        if ($chatId !== '') {
+            $candidates[] = $chatId;
+        }
+
+        foreach ($candidates as $key) {
+            if (!is_string($key)) {
+                continue;
+            }
+            if (isset($map[$key]) && is_string($map[$key]) && trim((string)$map[$key]) !== '') {
+                return trim((string)$map[$key]);
+            }
+        }
+
+        return null;
     }
 
-    private function enforceAltWindowLimit(string $phone, int $hours): void
+    private function altGatewayUsageWindowHours(): int
     {
-        $hours = max(1, min(240, $hours));
-        $since = time() - ($hours * 3600);
+        return max(1, $this->altGatewayRotationWindowHours);
+    }
+
+    private function altGatewayUsage(bool $forceRefresh = false): array
+    {
+        $now = time();
+        if (!$forceRefresh && $this->altGatewayUsageCache !== null && ($this->altGatewayUsageCache['expires_at'] ?? 0) > $now) {
+            return $this->altGatewayUsageCache['data'];
+        }
+
+        $since = $now - ($this->altGatewayUsageWindowHours() * 3600);
+        $usage = [];
+        foreach ($this->altGatewayInstances(true) as $instance) {
+            $usage[$instance['slug']] = $this->messages->countOutgoingByAltGatewaySince($instance['slug'], $since);
+        }
+
+        $this->altGatewayUsageCache = [
+            'expires_at' => $now + 30,
+            'data' => $usage,
+        ];
+
+        return $usage;
+    }
+
+    private function buildCampaignKey(?string $campaignKind, ?string $campaignToken): ?string
+    {
+        $kind = trim((string)$campaignKind);
+        if ($kind === '') {
+            return null;
+        }
+
+        $normalizedKind = mb_strtolower($kind);
+        $token = trim((string)$campaignToken);
+        if ($token !== '') {
+            $digits = digits_only($token);
+            $token = $digits !== '' ? $digits : $token;
+        }
+
+        if ($normalizedKind === 'birthday') {
+            if ($token === '') {
+                return null;
+            }
+
+            return 'birthday:' . $token;
+        }
+
+        if ($token !== '') {
+            return $normalizedKind . ':' . $token;
+        }
+
+        return null;
+    }
+
+    private function enforceAltDailyLimit(string $phone): void
+    {
+        $this->enforceAltWindowLimit($phone, null);
+    }
+
+    private function enforceAltWindowLimit(string $phone, ?int $hours = null): void
+    {
+        $windowHours = $hours !== null ? max(0.01, min(240, (float)$hours)) : $this->altPerNumberWindowHours;
+        $limit = max(1, $this->altPerNumberLimit);
+
+        $since = time() - (int)round($windowHours * 3600);
         $count = $this->messages->countOutgoingAltByPhoneSince($phone, $since);
-        if ($count >= 1) {
-            throw new RuntimeException('Já enviamos uma mensagem para este número nas últimas ' . $hours . ' horas. Tente novamente mais tarde.');
+        if ($count >= $limit) {
+            $windowLabel = $windowHours >= 1
+                ? rtrim(rtrim(number_format($windowHours, 2, ',', ''), '0'), ',') . ' horas'
+                : max(1, (int)round($windowHours * 60)) . ' minutos';
+            throw new RuntimeException(
+                'Limite atingido: ' . $count . '/' . $limit . ' mensagens para este número nas últimas ' . $windowLabel . '. Tente novamente mais tarde ou ajuste o limite em config/whatsapp_alt_gateways.php.'
+            );
+        }
+    }
+
+    private function enforcePerCampaignLimit(string $campaignKey, ?string $customMessage = null): void
+    {
+        if ($this->altPerCampaignLimit === null || $this->altPerCampaignWindowHours === null) {
+            return;
+        }
+
+        $windowSeconds = (int)round($this->altPerCampaignWindowHours * 3600);
+        if ($windowSeconds <= 0 || $this->altPerCampaignLimit <= 0) {
+            return;
+        }
+
+        $since = time() - $windowSeconds;
+        $count = $this->messages->countOutgoingByCampaignSince($campaignKey, $since);
+        if ($count >= $this->altPerCampaignLimit) {
+            $message = $customMessage ?? 'Limite de campanha atingido para este período.';
+            throw new RuntimeException($message);
         }
     }
 
@@ -5235,6 +6438,29 @@ private function isRateLimitError(string $message): bool
             'message_source',
             'ai_summary',
             'error',
+            'ack',
+            'reply_to',
+            'forwarded',
+            'history',
+            'channel_thread_id',
+            'wa_id',
+            'chat_id',
+            'presence',
+            'about',
+            'last_seen_at',
+            'profile_photo_etag',
+            'group_subject',
+            'group_metadata',
+            'group_participants',
+            'is_business',
+            'business_name',
+            'business_description',
+            'business_category',
+            'business_hours',
+            'gateway_snapshot',
+            'raw',
+            'participant',
+            'group_participant',
         ];
 
         $meta = [];
@@ -5355,47 +6581,85 @@ private function isRateLimitError(string $message): bool
 
     private function altGatewayCandidates(array $thread, int $limit = 3): array
     {
-        static $roundRobin = 0; // alterna lab01/lab02 entre chamadas no mesmo processo
+        $instances = $this->altGatewayInstances(true);
+        if ($instances === []) {
+            return [];
+        }
+
+        $usage = $this->altGatewayUsage();
+        $current = $this->extractAltGatewaySlugFromThread($thread);
+        $family = $this->altGatewayFamily($current);
+        if ($family !== null) {
+            $instances = array_values(array_filter($instances, function (array $instance) use ($family): bool {
+                return $this->altGatewayFamily($instance['slug']) === $family;
+            }));
+
+            if ($instances === []) {
+                throw new RuntimeException('Nenhum gateway habilitado para o canal informado.');
+            }
+        }
+
+        $lastUsed = $this->lastAltGatewaySelected;
 
         $candidates = [];
-        $current = $this->extractAltGatewaySlugFromThread($thread);
-        if ($current !== null) {
-            $candidates[] = $current;
+        foreach ($instances as $instance) {
+            $slug = $instance['slug'];
+            $sentCount = $usage[$slug] ?? 0;
+            $limitPerDay = max(0, (int)($instance['daily_limit'] ?? 0));
+            $available = $limitPerDay === 0 || $sentCount < $limitPerDay;
+
+            $candidates[] = [
+                'slug' => $slug,
+                'usage' => $sentCount,
+                'limit' => $limitPerDay,
+                'available' => $available,
+                'is_current' => $current !== null && $current === $slug,
+                'is_last_used' => $lastUsed !== null && $lastUsed === $slug,
+            ];
         }
 
-        $default = $this->defaultAltGatewaySlug();
-        if ($default !== null) {
-            $candidates[] = $default;
+        $available = array_values(array_filter($candidates, static fn(array $candidate): bool => $candidate['available']));
+        if ($available === []) {
+            throw new RuntimeException('Limite diário dos gateways alternativos atingido. Ative outro gateway (lab03/lab04/lab05) ou aumente o limite em config/whatsapp_alt_gateways.php.');
         }
 
-        foreach ($this->altGatewayInstances(true) as $instance) {
-            $candidates[] = $instance['slug'];
-        }
-
-        // Normalize e de-duplica
-        $unique = [];
-        foreach ($candidates as $candidate) {
-            $slug = $this->sanitizeAltGatewaySlug($candidate ?? '');
-            if ($slug === null || isset($unique[$slug])) {
-                continue;
+        usort($available, function (array $a, array $b): int {
+            if ($a['is_current'] !== $b['is_current']) {
+                return $a['is_current'] ? -1 : 1;
             }
-            $unique[$slug] = $slug;
-        }
 
-        $ordered = array_values($unique);
+            if ($a['usage'] !== $b['usage']) {
+                return $a['usage'] <=> $b['usage'];
+            }
 
-        // Reordena lab01/lab02 em round-robin para distribuir carga
-        $hasLab01 = in_array('lab01', $ordered, true);
-        $hasLab02 = in_array('lab02', $ordered, true);
-        if ($hasLab01 && $hasLab02) {
-            $pair = ($roundRobin % 2 === 0) ? ['lab01', 'lab02'] : ['lab02', 'lab01'];
-            $roundRobin++;
-            // Mantém demais na ordem original após o par
-            $rest = array_values(array_diff($ordered, $pair));
-            $ordered = array_values(array_unique(array_merge($pair, $rest)));
-        }
+            if ($a['is_last_used'] !== $b['is_last_used']) {
+                return $a['is_last_used'] ? 1 : -1;
+            }
+
+            return $a['slug'] <=> $b['slug'];
+        });
+
+        $ordered = array_column($available, 'slug');
 
         return array_slice($ordered, 0, max(1, $limit));
+    }
+
+    private function altGatewayFamily(?string $slug): ?string
+    {
+        $normalized = $this->sanitizeAltGatewaySlug($slug);
+        if ($normalized === null) {
+            return null;
+        }
+
+        if (str_starts_with($normalized, 'wpp')) {
+            return 'wpp';
+        }
+
+        if (str_starts_with($normalized, 'lab')) {
+            return 'lab';
+        }
+
+        return 'other';
     }
 
     private function dispatchAltGatewayMessage(string $phone, string $body, array $thread, ?array $media = null): array
@@ -5406,7 +6670,13 @@ private function isRateLimitError(string $message): bool
         $lastStatus = null;
         $lastRaw = null;
 
-        foreach ($this->altGatewayCandidates($thread, 3) as $candidateSlug) {
+        try {
+            $candidates = $this->altGatewayCandidates($thread, 3);
+        } catch (RuntimeException $exception) {
+            throw $exception;
+        }
+
+        foreach ($candidates as $candidateSlug) {
             $instance = $this->altGatewayInstance($candidateSlug);
             if ($instance === null) {
                 $attempted[] = ['slug' => $candidateSlug, 'status' => 'skipped', 'error' => 'alt_gateway_missing'];
@@ -5433,6 +6703,9 @@ private function isRateLimitError(string $message): bool
                     $this->threads->update((int)$currentThread['id'], ['channel_thread_id' => $targetChannelId]);
                     $currentThread['channel_thread_id'] = $targetChannelId;
                 }
+
+                $this->lastAltGatewaySelected = $candidateSlug;
+                $this->altGatewayUsageCache = null;
 
                 return array_merge($result, [
                     'thread' => $currentThread,
@@ -6115,6 +7388,26 @@ private function isRateLimitError(string $message): bool
         ];
     }
 
+    private function maskSensitiveText(string $text): string
+    {
+        $masked = $text;
+
+        $patterns = [
+            '/\\b\\d{3}\\.?\\d{3}\\.?\\d{3}-?\\d{2}\\b/u' => '[cpf]',
+            '/\\b\\d{2}\\.?\\d{3}\\.?\\d{3}\\/\\d{4}-?\\d{2}\\b/u' => '[cnpj]',
+            '/\\+?\\d{0,2}\\s?\\(?\\d{2}\\)?\\s?\\d{4,5}-?\\d{4}\\b/u' => '[telefone]',
+            '/[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}/iu' => '[email]',
+        ];
+
+        foreach ($patterns as $pattern => $replacement) {
+            $masked = (string)preg_replace($pattern, $replacement, $masked);
+        }
+
+        $masked = (string)preg_replace('/\\d{10,}/', '[dado]', $masked);
+
+        return trim((string)preg_replace('/\\s+/', ' ', $masked));
+    }
+
     private function captureTrainingSampleFromThread(array $thread): void
     {
         $threadId = (int)($thread['id'] ?? 0);
@@ -6125,12 +7418,13 @@ private function isRateLimitError(string $message): bool
         $contactId = isset($thread['contact_id']) ? (int)$thread['contact_id'] : null;
         $contact = $contactId !== null ? $this->contacts->find($contactId) : null;
         $messages = $this->messages->listForThread($threadId, 40);
+        $messages = array_slice($messages, -10);
 
         $structured = [];
         foreach ($messages as $message) {
             $structured[] = [
                 'direction' => $message['direction'] ?? 'incoming',
-                'content' => trim((string)($message['content'] ?? '')),
+                'content' => $this->maskSensitiveText(trim((string)($message['content'] ?? ''))),
                 'sent_at' => isset($message['sent_at']) ? (int)$message['sent_at'] : null,
             ];
         }
@@ -6139,9 +7433,9 @@ private function isRateLimitError(string $message): bool
         if ($summary === '') {
             $lastIncoming = $this->extractLastIncoming($messages);
             $summary = sprintf(
-                'Fila: %s | Última mensagem: %s',
+                'Fila: %s | Ultima mensagem: %s',
                 $thread['queue'] ?? 'arrival',
-                mb_substr(trim((string)($lastIncoming['content'] ?? '')), 0, 180)
+                mb_substr($this->maskSensitiveText(trim((string)($lastIncoming['content'] ?? ''))), 0, 180)
             );
         }
 
@@ -6281,16 +7575,16 @@ private function isRateLimitError(string $message): bool
     private function extractKeywords(string $text, int $limit = 6): array
     {
         $normalized = mb_strtolower($text, 'UTF-8');
-        $normalized = preg_replace('/[^a-z0-9áéíóúàâêôãõç\\s]/u', ' ', $normalized);
-        $parts = preg_split('/\\s+/', (string)$normalized) ?: [];
+        $normalized = preg_replace('/[^\p{L}\p{N}\s]/u', ' ', (string)$normalized);
+        $parts = preg_split('/\s+/', (string)$normalized) ?: [];
         $keywords = [];
 
         foreach ($parts as $word) {
             $word = trim($word);
-            if (mb_strlen($word, 'UTF-8') < 4) {
+            if ($word === '' || mb_strlen($word, 'UTF-8') < 4) {
                 continue;
             }
-            if (in_array($word, self::STOPWORDS, true)) {
+            if (in_array($word, self::KEYWORD_STOPWORDS, true)) {
                 continue;
             }
             $keywords[$word] = true;
@@ -6459,6 +7753,21 @@ private function isRateLimitError(string $message): bool
         }
 
         return null;
+    }
+
+    private function coerceTimestamp($value): ?int
+    {
+        if ($value === null || $value === '') {
+            return null;
+        }
+
+        if (is_numeric($value)) {
+            $intValue = (int)$value;
+            return $intValue > 0 ? $intValue : null;
+        }
+
+        $parsed = strtotime((string)$value);
+        return $parsed !== false ? $parsed : null;
     }
 
     private function mergeMessageMetadata(?string $existing, array $extra): ?string

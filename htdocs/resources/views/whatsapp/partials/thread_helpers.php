@@ -123,11 +123,11 @@ if (!function_exists('wa_resolve_thread_phone')) {
             $altPhoneRaw = $parts[1] ?? '';
             if ($altPhoneRaw !== '') {
                 $altPhoneClean = preg_replace('/@.*/', '', $altPhoneRaw) ?? $altPhoneRaw;
-                $formattedAlt = format_phone($altPhoneClean);
-                $altDigits = preg_replace('/\D+/', '', $altPhoneClean) ?: '';
-                if ($altDigits !== '' && strlen($altDigits) >= 12 && strlen($altDigits) <= 15 && !str_starts_with($altDigits, '55')) {
-                    $formattedAlt = 'Telefone não identificado';
+                $altDigits = wa_digits_only($altPhoneClean);
+                if ($altDigits !== '' && !str_starts_with($altDigits, '55') && strlen($altDigits) >= 10 && strlen($altDigits) <= 13) {
+                    $altDigits = '55' . $altDigits;
                 }
+                $formattedAlt = format_phone($altDigits !== '' ? $altDigits : $altPhoneClean);
                 if ($formattedAlt !== '') {
                     $candidates[] = $formattedAlt;
                 }
@@ -142,11 +142,11 @@ if (!function_exists('wa_resolve_thread_phone')) {
 
         $rawPhone = trim((string)($thread['contact_phone'] ?? ''));
         if ($rawPhone !== '') {
-            $formattedRaw = format_phone($rawPhone);
-            $rawDigits = preg_replace('/\D+/', '', $rawPhone) ?: '';
-            if ($rawDigits !== '' && strlen($rawDigits) >= 12 && strlen($rawDigits) <= 15 && !str_starts_with($rawDigits, '55')) {
-                $formattedRaw = 'Telefone não identificado';
+            $rawDigits = wa_digits_only($rawPhone);
+            if ($rawDigits !== '' && !str_starts_with($rawDigits, '55') && strlen($rawDigits) >= 10 && strlen($rawDigits) <= 13) {
+                $rawDigits = '55' . $rawDigits;
             }
+            $formattedRaw = format_phone($rawDigits !== '' ? $rawDigits : $rawPhone);
             if ($formattedRaw !== '') {
                 $candidates[] = $formattedRaw;
             }
@@ -163,10 +163,6 @@ if (!function_exists('wa_resolve_thread_phone')) {
         foreach ($candidates as $value) {
             $clean = trim((string)$value);
             if ($clean !== '' && stripos($clean, 'grupo whatsapp') === false) {
-                $digits = preg_replace('/\D+/', '', $clean) ?: '';
-                if ($digits !== '' && strlen($digits) >= 12 && strlen($digits) <= 15 && !str_starts_with($digits, '55')) {
-                    return 'Telefone não identificado';
-                }
                 return $clean;
             }
         }
@@ -431,6 +427,29 @@ if (!function_exists('wa_prepare_thread_view')) {
         }
         $phone = !$isGroupThread ? wa_resolve_thread_phone($thread) : '';
 
+        $photo = null;
+        $candidatePhoto = isset($thread['contact_photo']) ? (string)$thread['contact_photo'] : '';
+        if ($candidatePhoto !== '' && str_starts_with($candidatePhoto, 'http')) {
+            $photo = $candidatePhoto;
+        }
+
+        $initials = '';
+        $words = preg_split('/\s+/', trim($name));
+        if (is_array($words)) {
+            foreach ($words as $word) {
+                $first = mb_substr($word, 0, 1, 'UTF-8');
+                if ($first !== false && $first !== '') {
+                    $initials .= mb_strtoupper($first, 'UTF-8');
+                }
+                if (mb_strlen($initials, 'UTF-8') >= 2) {
+                    break;
+                }
+            }
+        }
+        if ($initials === '' && $phone !== '') {
+            $initials = '#';
+        }
+
         $origin = wa_describe_thread_origin($thread, $lineById, $altGatewayLookup, $lineByAltSlug);
         $lineLabel = trim((string)$origin['label']);
         $lineDisplayPhone = trim((string)$origin['phone']);
@@ -496,7 +515,11 @@ if (!function_exists('wa_prepare_thread_view')) {
         }
         $threadUrl = is_callable($buildUrl) ? (string)$buildUrl($threadUrlParams) : '#';
 
-        $showClaim = !empty($options['allow_claim'] ?? $options['claim']);
+        // Avoid undefined index notices when claim flags are absent
+        $showClaim = !empty($options['allow_claim'] ?? null);
+        if (!$showClaim && array_key_exists('claim', $options ?? [])) {
+            $showClaim = !empty($options['claim']);
+        }
         if ($panelKey === 'entrada') {
             $showClaim = true;
         }
@@ -622,11 +645,16 @@ if (!function_exists('wa_prepare_thread_view')) {
                 $lineLabel,
                 $lineDisplayPhone,
                 $threadId,
+                (string)($thread['channel_thread_id'] ?? ''),
             ],
             $metaLines,
             array_values($lineLabels),
             array_values($assignedNames)
         );
+        $phoneDigits = wa_digits_only($thread['contact_phone'] ?? '');
+        if ($phoneDigits !== '' && !str_starts_with($phoneDigits, '55')) {
+            $searchParts[] = '55' . $phoneDigits;
+        }
         if ($isGroupThread) {
             $searchParts[] = 'grupo';
         }
@@ -669,6 +697,8 @@ if (!function_exists('wa_prepare_thread_view')) {
             'arrival_label' => $arrivalTimestamp > 0 ? wa_format_timestamp($arrivalTimestamp) : '',
             'channel_thread_id' => $channelThreadId,
             'contact_display' => $displayName,
+            'photo' => $photo,
+            'initials' => $initials,
         ];
     }
 }
@@ -690,18 +720,27 @@ if (!function_exists('wa_render_thread_card')) {
 <article class="wa-mini-thread<?= $view['is_active'] ? ' is-active' : ''; ?>" data-thread-search="<?= htmlspecialchars($view['search_index'], ENT_QUOTES, 'UTF-8'); ?>" data-thread-panel="<?= htmlspecialchars($view['panel_key'], ENT_QUOTES, 'UTF-8'); ?>" data-thread-id="<?= $view['thread_id']; ?>">
     <a class="wa-mini-link" href="<?= htmlspecialchars($view['thread_url'], ENT_QUOTES, 'UTF-8'); ?>">
         <div class="wa-mini-header">
-            <div class="wa-mini-title">
-                <strong><?= htmlspecialchars($view['name'], ENT_QUOTES, 'UTF-8'); ?></strong>
-                <?php if (!empty($view['client_id'])): ?>
-                    <span class="wa-client-icon" title="Cliente do CRM" aria-label="Cliente do CRM">
-                        <svg viewBox="0 0 24 24" role="img" aria-hidden="true" focusable="false">
-                            <path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-3.33 0-6 1.34-6 3v1h12v-1c0-1.66-2.67-3-6-3z" />
-                        </svg>
-                    </span>
-                <?php endif; ?>
-                <?php if (!empty($view['is_group'])): ?>
-                    <span class="wa-chip">Grupo</span>
-                <?php endif; ?>
+            <div class="wa-mini-ident">
+                <div class="wa-mini-avatar<?= $view['photo'] ? ' has-photo' : ''; ?>">
+                    <?php if ($view['photo']): ?>
+                        <img src="<?= htmlspecialchars($view['photo'], ENT_QUOTES, 'UTF-8'); ?>" alt="Foto do contato" loading="lazy" decoding="async">
+                    <?php else: ?>
+                        <span><?= htmlspecialchars($view['initials'], ENT_QUOTES, 'UTF-8'); ?></span>
+                    <?php endif; ?>
+                </div>
+                <div class="wa-mini-title">
+                    <strong><?= htmlspecialchars($view['name'], ENT_QUOTES, 'UTF-8'); ?></strong>
+                    <?php if (!empty($view['client_id'])): ?>
+                        <span class="wa-client-icon" title="Cliente do CRM" aria-label="Cliente do CRM">
+                            <svg viewBox="0 0 24 24" role="img" aria-hidden="true" focusable="false">
+                                <path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-3.33 0-6 1.34-6 3v1h12v-1c0-1.66-2.67-3-6-3z" />
+                            </svg>
+                        </span>
+                    <?php endif; ?>
+                    <?php if (!empty($view['is_group'])): ?>
+                        <span class="wa-chip">Grupo</span>
+                    <?php endif; ?>
+                </div>
             </div>
             <?php if ($view['unread'] > 0): ?>
                 <span class="wa-unread"><?= (int)$view['unread']; ?></span>
@@ -815,6 +854,8 @@ if (!function_exists('wa_collect_thread_meta')) {
             'channel_thread_id' => $view['channel_thread_id'],
             'contact_display' => $view['contact_display'],
             'arrival_timestamp' => $view['arrival_timestamp'],
+            'contact_photo' => $view['photo'],
+            'contact_initials' => $view['initials'],
         ];
     }
 }

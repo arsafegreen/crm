@@ -1307,6 +1307,7 @@ foreach ($navSections as $section) {
             <?php endif; ?>
             <?php if ($showApproval): ?>
                 <a class="approval-button" href="<?= url('admin/access-requests'); ?>">Liberação</a>
+                <a class="approval-button" href="<?= url('ai-chat.php'); ?>" target="_blank" rel="noopener">AI Chat</a>
             <?php endif; ?>
         </div>
     <?php endif; ?>
@@ -1348,7 +1349,12 @@ foreach ($navSections as $section) {
                 <button type="button" class="chat-floating-close" data-chat-widget-close aria-label="Minimizar chat">&times;</button>
             </header>
             <div class="chat-floating-frame">
-                <iframe title="Chat interno" data-chat-widget-frame data-src="<?= htmlspecialchars(url('chat') . '?chat_widget=1', ENT_QUOTES, 'UTF-8'); ?>" loading="lazy"></iframe>
+                <iframe
+                    title="Chat interno"
+                    data-chat-widget-frame
+                    src="<?= htmlspecialchars(url('chat') . '?chat_widget=1', ENT_QUOTES, 'UTF-8'); ?>"
+                    data-src="<?= htmlspecialchars(url('chat') . '?chat_widget=1', ENT_QUOTES, 'UTF-8'); ?>"
+                    loading="lazy"></iframe>
             </div>
         </div>
         <button type="button" class="chat-floating-launcher" data-chat-launcher aria-expanded="false">

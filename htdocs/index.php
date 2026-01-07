@@ -758,7 +758,7 @@ $canonicalUrl = rtrim($baseUrl, '/') . '/';
         </header>
         <div data-floating-intro>
             <p class="small">Preencha os dados e abriremos uma conversa aguardando um especialista.</p>
-            <form method="post" action="<?= htmlspecialchars($baseUrl, ENT_QUOTES, 'UTF-8'); ?>/public/chat/external-thread" data-floating-chat-form>
+            <form method="post" action="<?= htmlspecialchars($baseUrl, ENT_QUOTES, 'UTF-8'); ?>/chat/external-thread" data-floating-chat-form>
                 <label>Nome completo
                     <input type="text" name="full_name" required placeholder="Seu nome">
                 </label>

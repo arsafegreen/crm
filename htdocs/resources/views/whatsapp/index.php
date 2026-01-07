@@ -131,6 +131,23 @@ foreach ($altGateways as $altGateway) {
     $altGatewayLookup[$slug] = $altGateway;
 }
 
+$defaultGatewayInstance = null;
+if ($selectedChannel === 'alt_wpp') {
+    foreach ($altGatewayLookup as $slug => $gateway) {
+        if (str_starts_with($slug, 'wpp')) {
+            $defaultGatewayInstance = $slug;
+            break;
+        }
+    }
+} elseif ($selectedChannel === 'alt_lab') {
+    foreach ($altGatewayLookup as $slug => $gateway) {
+        if (str_starts_with($slug, 'lab')) {
+            $defaultGatewayInstance = $slug;
+            break;
+        }
+    }
+}
+
 $queueSummary = array_merge([
     'arrival' => 0,
     'scheduled' => 0,
@@ -143,9 +160,17 @@ $channelOptions = [
         'label' => 'Canal oficial Meta',
         'description' => 'API oficial (Meta/Facebook) com webhooks e templates.',
     ],
+    'alt_lab' => [
+        'label' => 'WhatsApp Lab (Alt 1)',
+        'description' => 'Gateways laboratório (slugs lab*) isolados do oficial e do WPP.',
+    ],
+    'alt_wpp' => [
+        'label' => 'WhatsApp WPP (Alt 2)',
+        'description' => 'Gateway QR (slugs wpp*) com payload completo e fotos.',
+    ],
     'alt' => [
-        'label' => 'Canal alternativo',
-        'description' => 'Gateway WhatsApp Web (WPPConnect) para testes híbridos.',
+        'label' => 'Alternativos (todos)',
+        'description' => 'Visão agregada de todos os gateways alternativos.',
     ],
 ];
 $selectedChannel = isset($selectedChannel) && $selectedChannel !== '' ? $selectedChannel : null;
@@ -342,6 +367,15 @@ if (!empty($contactMetadata['profile_photo']) && is_string($contactMetadata['pro
         $contactProfilePhoto = $candidatePhoto;
     }
 }
+$contactRawFrom = (string)($contactMetadata['raw_from'] ?? '');
+$contactNormalizedFrom = (string)($contactMetadata['normalized_from'] ?? '');
+$contactGatewaySnapshot = isset($contactMetadata['gateway_snapshot']) && is_array($contactMetadata['gateway_snapshot'])
+    ? $contactMetadata['gateway_snapshot']
+    : null;
+$contactGatewaySource = is_array($contactGatewaySnapshot) ? (string)($contactGatewaySnapshot['source'] ?? '') : '';
+$contactGatewayCapturedAt = is_array($contactGatewaySnapshot) && isset($contactGatewaySnapshot['captured_at'])
+    ? (int)$contactGatewaySnapshot['captured_at']
+    : 0;
 
 
 
@@ -704,7 +738,12 @@ $renderThreadCard = static function (array $thread, array $options = []) use ($a
         $lineLabel,
         $lineDisplayPhone,
         $threadId,
+        (string)($thread['channel_thread_id'] ?? ''),
     ];
+    $phoneDigits = $digitsOnly($thread['contact_phone'] ?? '');
+    if ($phoneDigits !== '' && !str_starts_with($phoneDigits, '55')) {
+        $searchParts[] = '55' . $phoneDigits;
+    }
     if ($isGroupThread) {
         $searchParts[] = 'grupo';
     }
@@ -975,6 +1014,29 @@ $renderCompactThread = static function (array $thread, array $options = []) use 
         $name = $displayName;
     }
     $phone = !$isGroupThread ? $resolveThreadPhone($thread) : '';
+
+    $photo = null;
+    $candidatePhoto = isset($thread['contact_photo']) ? (string)$thread['contact_photo'] : '';
+    if ($candidatePhoto !== '' && str_starts_with($candidatePhoto, 'http')) {
+        $photo = $candidatePhoto;
+    }
+
+    $initials = '';
+    $words = preg_split('/\s+/', trim($name));
+    if (is_array($words)) {
+        foreach ($words as $word) {
+            $first = mb_substr($word, 0, 1, 'UTF-8');
+            if ($first !== false && $first !== '') {
+                $initials .= mb_strtoupper($first, 'UTF-8');
+            }
+            if (mb_strlen($initials, 'UTF-8') >= 2) {
+                break;
+            }
+        }
+    }
+    if ($initials === '' && $phone !== '') {
+        $initials = '#';
+    }
 
     $origin = $describeThreadOrigin($thread);
     $lineLabel = trim((string)$origin['label']);
@@ -1261,15 +1323,31 @@ $renderCompactThread = static function (array $thread, array $options = []) use 
         <a class="wa-mini-link" href="<?= htmlspecialchars($threadUrl, ENT_QUOTES, 'UTF-8'); ?>">
 
             <div class="wa-mini-header">
+                <div class="wa-mini-ident">
+                    <div class="wa-mini-avatar<?= $photo ? ' has-photo' : ''; ?>">
+                        <?php if ($photo): ?>
+                            <img src="<?= htmlspecialchars($photo, ENT_QUOTES, 'UTF-8'); ?>" alt="Foto do contato" loading="lazy" decoding="async">
+                        <?php else: ?>
+                            <span><?= htmlspecialchars($initials, ENT_QUOTES, 'UTF-8'); ?></span>
+                        <?php endif; ?>
+                    </div>
+                    <div class="wa-mini-title">
+                        <strong><?= htmlspecialchars($name, ENT_QUOTES, 'UTF-8'); ?></strong>
 
-                <div class="wa-mini-title">
-                    <strong><?= htmlspecialchars($name, ENT_QUOTES, 'UTF-8'); ?></strong>
+                        <?php if (!empty($clientId)): ?>
+                            <span class="wa-client-icon" title="Cliente do CRM" aria-label="Cliente do CRM">
+                                <svg viewBox="0 0 24 24" role="img" aria-hidden="true" focusable="false">
+                                    <path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-3.33 0-6 1.34-6 3v1h12v-1c0-1.66-2.67-3-6-3z" />
+                                </svg>
+                            </span>
+                        <?php endif; ?>
 
-                    <?php if ($isGroupThread): ?>
+                        <?php if ($isGroupThread): ?>
 
-                        <span class="wa-chip">Grupo</span>
+                            <span class="wa-chip">Grupo</span>
 
-                    <?php endif; ?>
+                        <?php endif; ?>
+                    </div>
                 </div>
 
                 <?php if ($unread > 0): ?>
@@ -1654,6 +1732,18 @@ foreach ($panelConfig as $panelKey => $panelData) {
 
     .wa-contact-identity { display:flex; flex-direction:column; gap:4px; }
 
+    .wa-contact-main { display:flex; align-items:center; gap:12px; }
+
+    .wa-contact-avatar { width:54px; height:54px; border-radius:14px; background:rgba(148,163,184,0.18); border:1px solid rgba(148,163,184,0.28); display:inline-flex; align-items:center; justify-content:center; color:#e2e8f0; font-weight:700; box-shadow:0 6px 18px rgba(2,6,23,0.4); overflow:hidden; }
+    .wa-contact-avatar span { font-size:1rem; letter-spacing:0.4px; }
+    .wa-contact-avatar img { width:100%; height:100%; object-fit:cover; display:block; }
+    .wa-contact-avatar.has-photo { background:rgba(255,255,255,0.02); border-color:rgba(148,163,184,0.45); }
+
+    .wa-contact-meta { display:flex; flex-direction:column; gap:4px; }
+    .wa-contact-row { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+    .wa-contact-status { display:flex; align-items:center; gap:6px; color:var(--muted); font-size:0.82rem; }
+    .wa-status-dot { width:8px; height:8px; border-radius:999px; background:#22c55e; box-shadow:0 0 0 4px rgba(34,197,94,0.14); display:inline-block; }
+
     .wa-contact-unread { display:block; }
 
     .wa-contact-phone { margin:0; color:var(--muted); font-size:0.9rem; }
@@ -1684,7 +1774,14 @@ foreach ($panelConfig as $panelKey => $panelData) {
 
     .wa-mini-link { text-decoration:none; color:var(--text); display:flex; flex-direction:column; gap:4px; }
 
-    .wa-mini-header { display:flex; justify-content:space-between; align-items:flex-start; gap:8px; flex-wrap:wrap; }
+    .wa-mini-header { display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap; }
+
+    .wa-mini-ident { display:flex; align-items:center; gap:10px; min-width:0; }
+
+    .wa-mini-avatar { width:40px; height:40px; border-radius:12px; background:rgba(148,163,184,0.15); display:inline-flex; align-items:center; justify-content:center; color:#e2e8f0; font-weight:700; flex-shrink:0; overflow:hidden; border:1px solid rgba(148,163,184,0.25); box-shadow:0 4px 12px rgba(2,6,23,0.35); }
+    .wa-mini-avatar span { font-size:0.95rem; letter-spacing:0.5px; }
+    .wa-mini-avatar img { width:100%; height:100%; object-fit:cover; display:block; }
+    .wa-mini-avatar.has-photo { background:rgba(255,255,255,0.02); border-color:rgba(148,163,184,0.4); }
 
     .wa-mini-title { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
 
@@ -1783,12 +1880,14 @@ foreach ($panelConfig as $panelKey => $panelData) {
     .wa-media-actions { display:flex; justify-content:flex-start; margin-bottom:8px; }
     .wa-media-actions a { display:inline-flex; align-items:center; gap:6px; font-size:0.82rem; padding:6px 10px; border-radius:10px; border:1px solid rgba(148,163,184,0.4); text-decoration:none; color:var(--text); background:rgba(15,23,42,0.45); }
     .wa-media-actions a:hover { border-color:#22c55e; color:#22c55e; }
-    .wa-status-indicator { position:absolute; top:8px; right:12px; font-size:0.8rem; line-height:1; color:transparent; -webkit-text-stroke:1px rgba(148,163,184,0.85); }
-    .wa-status-indicator.is-sent { color:transparent; -webkit-text-stroke:1px rgba(248,250,252,0.9); }
-    .wa-status-indicator.is-delivered { color:#f8fafc; -webkit-text-stroke:0; }
-    .wa-status-indicator.is-read { color:#16a34a; -webkit-text-stroke:0; }
-    .wa-status-indicator.is-error { color:#ef4444; -webkit-text-stroke:0; }
-    .wa-status-indicator.is-pending { color:transparent; -webkit-text-stroke:1px rgba(248,250,252,0.5); }
+    .wa-status-indicator { display:inline-flex; align-items:center; gap:2px; margin-left:6px; vertical-align:middle; }
+    .wa-status-indicator .wa-check { font-size:0.85rem; line-height:1; color:transparent; -webkit-text-stroke:1px rgba(148,163,184,0.85); opacity:0; transform-origin:center; transition:color 120ms ease, -webkit-text-stroke 120ms ease, opacity 120ms ease; }
+    .wa-status-indicator .check-2 { transform:translateX(-2px); }
+    .wa-status-indicator.is-pending .wa-check { opacity:0.6; color:transparent; -webkit-text-stroke:1px rgba(248,250,252,0.5); }
+    .wa-status-indicator.is-sent .check-1 { opacity:1; color:transparent; -webkit-text-stroke:1px rgba(248,250,252,0.9); }
+    .wa-status-indicator.is-delivered .wa-check { opacity:1; color:#f8fafc; -webkit-text-stroke:0; }
+    .wa-status-indicator.is-read .wa-check { opacity:1; color:#22c55e; -webkit-text-stroke:0; }
+    .wa-status-indicator.is-error .wa-check { opacity:1; color:#ef4444; -webkit-text-stroke:0; }
     .wa-audio-recorder { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:12px; }
     .wa-audio-recorder [data-audio-status] { flex:1 1 100%; margin-top:4px; }
 
@@ -2010,6 +2109,9 @@ foreach ($panelConfig as $panelKey => $panelData) {
             </div>
             <p class="wa-search-feedback" data-thread-search-feedback hidden></p>
             <div class="wa-search-actions">
+                <button type="button" class="ghost" data-thread-search-apply>Aplicar filtro</button>
+            </div>
+            <div class="wa-search-actions">
                 <button type="button" class="wa-notify-gear" data-notify-panel-toggle aria-expanded="false" aria-controls="wa-notify-panel">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
                         <circle cx="12" cy="12" r="2.5"></circle>
@@ -2145,14 +2247,37 @@ foreach ($panelConfig as $panelKey => $panelData) {
 
                 <header class="wa-card-header wa-contact-header" style="margin-bottom:16px;">
 
+                    <?php
+                        $activeContactInitials = strtoupper(mb_substr($activeContactName !== '' ? $activeContactName : 'C', 0, 2, 'UTF-8'));
+                        $lastSeenTs = (int)($activeThread['last_message_at'] ?? ($activeThread['updated_at'] ?? 0));
+                        $lastSeenLabel = $lastSeenTs > 0 ? $formatTimestamp($lastSeenTs) : '—';
+                    ?>
+
                     <div class="wa-contact-identity">
-                        <h3 style="margin:0;"><?= htmlspecialchars($activeContactName, ENT_QUOTES, 'UTF-8'); ?></h3>
-                        <?php if ($activeUnreadCount > 0): ?>
-                            <span class="wa-contact-unread"><span class="wa-unread">+<?= $activeUnreadCount; ?></span></span>
-                        <?php endif; ?>
-                        <?php if ($activeContactPhone !== ''): ?>
-                            <p class="wa-contact-phone" data-contact-phone-display><?= htmlspecialchars($activeContactPhone, ENT_QUOTES, 'UTF-8'); ?></p>
-                        <?php endif; ?>
+                        <div class="wa-contact-main">
+                            <div class="wa-contact-avatar<?= $contactProfilePhoto !== null ? ' has-photo' : ''; ?>">
+                                <?php if ($contactProfilePhoto !== null): ?>
+                                    <img src="<?= htmlspecialchars($contactProfilePhoto, ENT_QUOTES, 'UTF-8'); ?>" alt="Foto do contato" loading="lazy" decoding="async">
+                                <?php else: ?>
+                                    <span><?= htmlspecialchars($activeContactInitials, ENT_QUOTES, 'UTF-8'); ?></span>
+                                <?php endif; ?>
+                            </div>
+                            <div class="wa-contact-meta">
+                                <h3 style="margin:0;"><?= htmlspecialchars($activeContactName, ENT_QUOTES, 'UTF-8'); ?></h3>
+                                <div class="wa-contact-row">
+                                    <?php if ($activeUnreadCount > 0): ?>
+                                        <span class="wa-contact-unread"><span class="wa-unread">+<?= $activeUnreadCount; ?></span></span>
+                                    <?php endif; ?>
+                                    <?php if ($activeContactPhone !== ''): ?>
+                                        <span class="wa-contact-phone" data-contact-phone-display><?= htmlspecialchars($activeContactPhone, ENT_QUOTES, 'UTF-8'); ?></span>
+                                    <?php endif; ?>
+                                </div>
+                                <div class="wa-contact-status" aria-label="Última atividade">
+                                    <span class="wa-status-dot"></span>
+                                    <small><?= htmlspecialchars('Última atividade: ' . $lastSeenLabel, ENT_QUOTES, 'UTF-8'); ?></small>
+                                </div>
+                            </div>
+                        </div>
                     </div>
 
                     <div class="wa-contact-actions">
@@ -2230,10 +2355,33 @@ foreach ($panelConfig as $panelKey => $panelData) {
                             <?php if ($activeContactPhone !== ''): ?>
                                 <span style="color:var(--muted);font-size:0.92rem;">Telefone: <?= htmlspecialchars($activeContactPhone, ENT_QUOTES, 'UTF-8'); ?></span>
                             <?php endif; ?>
-                            <?php if (!empty($contactMetadata['raw_from'])): ?>
-                                <span style="color:rgba(148,163,184,0.8);font-size:0.86rem;">Origem: <?= htmlspecialchars((string)$contactMetadata['raw_from'], ENT_QUOTES, 'UTF-8'); ?></span>
+                            <?php if ($contactRawFrom !== ''): ?>
+                                <span style="color:rgba(148,163,184,0.8);font-size:0.86rem;">Origem: <?= htmlspecialchars($contactRawFrom, ENT_QUOTES, 'UTF-8'); ?></span>
+                            <?php endif; ?>
+                            <?php if ($contactNormalizedFrom !== '' && $contactNormalizedFrom !== preg_replace('/\D+/', '', $activeContactPhone)): ?>
+                                <span style="color:rgba(148,163,184,0.8);font-size:0.86rem;">Normalizado: <?= htmlspecialchars(format_phone($contactNormalizedFrom), ENT_QUOTES, 'UTF-8'); ?></span>
+                            <?php endif; ?>
+                            <?php if ($contactGatewaySource !== ''): ?>
+                                <span style="color:rgba(148,163,184,0.8);font-size:0.86rem;">Gateway: <?= htmlspecialchars($contactGatewaySource, ENT_QUOTES, 'UTF-8'); ?></span>
+                            <?php endif; ?>
+                            <?php if ($contactGatewayCapturedAt > 0): ?>
+                                <span style="color:rgba(148,163,184,0.8);font-size:0.86rem;">Capturado: <?= htmlspecialchars($formatTimestamp($contactGatewayCapturedAt), ENT_QUOTES, 'UTF-8'); ?></span>
                             <?php endif; ?>
                         </div>
+                    </div>
+                    <div style="margin-top:10px;display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;">
+                        <?php if (!empty($contactMetadata['email'])): ?>
+                            <div><strong style="color:var(--muted);font-size:0.82rem;">E-mail</strong><div><?= htmlspecialchars((string)$contactMetadata['email'], ENT_QUOTES, 'UTF-8'); ?></div></div>
+                        <?php endif; ?>
+                        <?php if (!empty($contactMetadata['cpf'])): ?>
+                            <div><strong style="color:var(--muted);font-size:0.82rem;">Documento</strong><div><?= htmlspecialchars((string)$contactMetadata['cpf'], ENT_QUOTES, 'UTF-8'); ?></div></div>
+                        <?php endif; ?>
+                        <?php if (!empty($contactMetadata['tags']) && is_array($contactMetadata['tags'])): ?>
+                            <div><strong style="color:var(--muted);font-size:0.82rem;">Tags</strong><div><?= htmlspecialchars(implode(', ', $contactMetadata['tags']), ENT_QUOTES, 'UTF-8'); ?></div></div>
+                        <?php endif; ?>
+                        <?php if (!empty($contactMetadata['gateway_snapshot']['meta_message_id'])): ?>
+                            <div><strong style="color:var(--muted);font-size:0.82rem;">Ult. meta_message_id</strong><div><?= htmlspecialchars((string)$contactMetadata['gateway_snapshot']['meta_message_id'], ENT_QUOTES, 'UTF-8'); ?></div></div>
+                        <?php endif; ?>
                     </div>
                 </div>
 
@@ -2421,10 +2569,17 @@ foreach ($panelConfig as $panelKey => $panelData) {
                                 if ($statusValue === '' && $direction === 'incoming') {
                                     $statusValue = 'delivered';
                                 }
+                                $statusTimestamp = isset($message['sent_at']) ? (int)$message['sent_at'] : 0;
                                 $statusMap = [
                                     'queued' => ['class' => 'is-pending', 'label' => 'Na fila'],
+                                    'pending' => ['class' => 'is-pending', 'label' => 'Processando'],
                                     'saving' => ['class' => 'is-pending', 'label' => 'Registrando'],
-                                    'saved' => ['class' => 'is-pending', 'label' => 'Registrando'],
+                                    'saved' => ['class' => 'is-pending', 'label' => 'Registrado'],
+                                    'processing' => ['class' => 'is-pending', 'label' => 'Processando'],
+                                    'async' => ['class' => 'is-pending', 'label' => 'Processando'],
+                                    'background' => ['class' => 'is-pending', 'label' => 'Processando'],
+                                    'retrying' => ['class' => 'is-pending', 'label' => 'Reenviando'],
+                                    'requeued' => ['class' => 'is-pending', 'label' => 'Reenfileirado'],
                                     'sent' => ['class' => 'is-sent', 'label' => 'Enviado'],
                                     'delivered' => ['class' => 'is-delivered', 'label' => 'Recebido'],
                                     'imported' => ['class' => 'is-delivered', 'label' => 'Registrado'],
@@ -2433,14 +2588,14 @@ foreach ($panelConfig as $panelKey => $panelData) {
                                     'failed' => ['class' => 'is-error', 'label' => 'Erro ao enviar'],
                                 ];
                                 $statusMeta = $statusMap[$statusValue] ?? ['class' => 'is-pending', 'label' => 'Processando'];
+                                $statusTooltip = $statusMeta['label'];
+                                if ($statusTimestamp > 0) {
+                                    $statusTooltip .= ' • ' . $formatTimestamp($statusTimestamp);
+                                }
 
                             ?>
 
                             <div class="<?= $bubbleClass; ?>" data-message-id="<?= (int)($message['id'] ?? 0); ?>">
-
-                                <?php if ($direction === 'outgoing'): ?>
-                                    <span class="wa-status-indicator <?= $statusMeta['class']; ?>" title="<?= htmlspecialchars($statusMeta['label'], ENT_QUOTES, 'UTF-8'); ?>">★</span>
-                                <?php endif; ?>
 
                                 <?php if ($direction === 'outgoing' && $actorLabel !== ''): ?>
 
@@ -2534,6 +2689,13 @@ foreach ($panelConfig as $panelKey => $panelData) {
 
                                     <span class="wa-message-time"><?= htmlspecialchars($formatTimestamp((int)($message['sent_at'] ?? 0)), ENT_QUOTES, 'UTF-8'); ?></span>
 
+                                    <?php if ($direction === 'outgoing'): ?>
+                                        <span class="wa-status-indicator <?= $statusMeta['class']; ?>" title="<?= htmlspecialchars($statusTooltip, ENT_QUOTES, 'UTF-8'); ?>">
+                                            <span class="wa-check check-1">✓</span>
+                                            <span class="wa-check check-2">✓</span>
+                                        </span>
+                                    <?php endif; ?>
+
                                 </footer>
 
                             </div>
@@ -2550,8 +2712,9 @@ foreach ($panelConfig as $panelKey => $panelData) {
 
             <article class="wa-card">
 
-                <form class="wa-message-form" id="wa-message-form" enctype="multipart/form-data">
+                <form class="wa-message-form" id="wa-message-form" enctype="multipart/form-data" method="post" action="<?= htmlspecialchars(url('whatsapp/send-message'), ENT_QUOTES, 'UTF-8'); ?>">
 
+                    <input type="hidden" name="_token" value="<?= htmlspecialchars(csrf_token(), ENT_QUOTES, 'UTF-8'); ?>">
                     <input type="hidden" name="thread_id" value="<?= $activeThreadId; ?>">
                     <input type="hidden" name="template_kind" value="" data-template-kind>
                     <input type="hidden" name="template_key" value="" data-template-key>
@@ -3153,6 +3316,21 @@ foreach ($panelConfig as $panelKey => $panelData) {
             <input type="hidden" name="contact_id" value="<?= (int)($activeContact['id'] ?? 0); ?>">
             <input type="hidden" name="client_id" value="" data-register-client-id>
 
+            <div class="wa-form-field">
+
+                <span>Localizar cliente (nome, CPF, CNPJ ou razão social)</span>
+
+                <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+                    <input type="text" data-register-client-search placeholder="Digite parte do nome, CPF ou CNPJ" style="flex:1;min-width:220px;">
+                    <button type="button" class="ghost" data-register-client-search-btn>Buscar</button>
+                </div>
+
+                <small class="wa-feedback" data-register-client-search-feedback></small>
+
+                <div data-register-client-search-results style="margin-top:8px;display:none;border:1px solid var(--border);border-radius:12px;overflow:hidden;"></div>
+
+            </div>
+
             <label class="wa-form-field">
 
                 <span>Nome completo *</span>
@@ -3234,7 +3412,18 @@ foreach ($panelConfig as $panelKey => $panelData) {
 
         </div>
 
-        <form class="wa-new-thread__form" data-new-thread-form>
+        <form class="wa-new-thread__form" data-new-thread-form method="post" action="<?= htmlspecialchars(url('whatsapp/manual-thread'), ENT_QUOTES, 'UTF-8'); ?>">
+            <input type="hidden" name="_token" value="<?= htmlspecialchars(csrf_token(), ENT_QUOTES, 'UTF-8'); ?>">
+            <input type="hidden" name="redirect" value="1">
+            <?php if ($defaultGatewayInstance !== null): ?>
+                <input type="hidden" name="gateway_instance" value="<?= htmlspecialchars($defaultGatewayInstance, ENT_QUOTES, 'UTF-8'); ?>">
+            <?php endif; ?>
+            <?php if ($selectedChannel !== null): ?>
+                <input type="hidden" name="channel" value="<?= htmlspecialchars($selectedChannel, ENT_QUOTES, 'UTF-8'); ?>">
+            <?php endif; ?>
+            <?php if ($standaloneView): ?>
+                <input type="hidden" name="standalone" value="1">
+            <?php endif; ?>
 
             <label class="wa-form-field">
 
@@ -3277,6 +3466,51 @@ foreach ($panelConfig as $panelKey => $panelData) {
 </div>
 
 
+
+<script>
+(function() {
+    const overflowKey = 'data-wa-new-thread-overflow';
+    const modal = document.querySelector('[data-new-thread-modal]');
+    const openModal = () => {
+        if (!modal) return;
+        modal.classList.add('is-visible');
+        modal.setAttribute('aria-hidden', 'false');
+        document.body.setAttribute(overflowKey, document.body.style.overflow || '');
+        document.body.style.overflow = 'hidden';
+        const firstInput = modal.querySelector('input[name="contact_name"]');
+        if (firstInput) {
+            firstInput.focus();
+        }
+    };
+    const closeModal = () => {
+        if (!modal) return;
+        modal.classList.remove('is-visible');
+        modal.setAttribute('aria-hidden', 'true');
+        const previous = document.body.getAttribute(overflowKey) || '';
+        document.body.style.overflow = previous;
+    };
+    window.__waFallbackNewThreadOpen = openModal;
+    window.__waFallbackNewThreadClose = closeModal;
+    document.addEventListener('click', (event) => {
+        const openBtn = event.target.closest('[data-new-thread-toggle]');
+        if (openBtn) {
+            event.preventDefault();
+            openModal();
+            return;
+        }
+        const closeBtn = event.target.closest('[data-new-thread-close]');
+        if (closeBtn) {
+            event.preventDefault();
+            closeModal();
+        }
+    });
+    document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') {
+            closeModal();
+        }
+    });
+})();
+</script>
 
 <div class="wa-client-popover" data-client-popover aria-hidden="true">
 

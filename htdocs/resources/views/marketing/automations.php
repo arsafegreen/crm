@@ -89,6 +89,19 @@ $automationToken = config('app.automation_token', '');
         </div>
     </header>
 
+    <div id="email-status-panel" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;margin-bottom:12px;">
+        <div class="card" style="padding:12px;border:1px solid var(--border);border-radius:12px;background:rgba(15,23,42,0.45);">
+            <div style="font-weight:700;margin-bottom:6px;">Status de envio</div>
+            <div id="email-status-text" style="color:var(--muted);">Carregando status…</div>
+            <div id="email-limit-text" style="color:var(--muted);margin-top:4px;font-size:0.95rem;"></div>
+            <button type="button" class="ghost" id="email-status-refresh" style="margin-top:8px;">Atualizar status</button>
+        </div>
+        <div class="card" id="email-batch-card" style="padding:12px;border:1px solid var(--border);border-radius:12px;background:rgba(15,23,42,0.45);display:none;">
+            <div style="font-weight:700;margin-bottom:6px;">Últimos lotes</div>
+            <div id="email-batch-list" style="color:var(--muted);display:flex;flex-direction:column;gap:4px;"></div>
+        </div>
+    </div>
+
     <div style="display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));align-items:flex-start;">
         <label style="display:flex;flex-direction:column;gap:6px;font-weight:600;">
             Template
@@ -360,9 +373,15 @@ $automationToken = config('app.automation_token', '');
         const emailScheduleStatus = document.getElementById('email-schedule-status');
         const emailListInfo = document.getElementById('email-list-info');
         const emailOptionsRefresh = document.getElementById('email-options-refresh');
+        const emailStatusText = document.getElementById('email-status-text');
+        const emailLimitText = document.getElementById('email-limit-text');
+        const emailStatusRefresh = document.getElementById('email-status-refresh');
+        const emailBatchCard = document.getElementById('email-batch-card');
+        const emailBatchList = document.getElementById('email-batch-list');
         let emailSources = [];
         const emailOptionsCacheKey = 'marketingEmailOptionsCache_v1';
         const automationToken = '<?= htmlspecialchars((string)$automationToken, ENT_QUOTES, 'UTF-8'); ?>';
+        let emailStatusTimer = null;
 
         function setEmailUiError(message) {
             if (emailScheduleStatus) {
@@ -658,7 +677,11 @@ $automationToken = config('app.automation_token', '');
                 const data = await fetchJson('<?= url('marketing/automations/blocking'); ?>', { headers: { 'Accept': 'application/json' } });
                 setBlockUi(Boolean(data.enabled), Number(data.window_hours || 24));
             } catch (err) {
-                if (blockStatus) blockStatus.textContent = err.message || 'Falha ao carregar bloqueio.';
+                const msg = err.message || 'Falha ao carregar opções.';
+                setEmailOptionsLoading(false, cached ? 'Usando cache. Falha ao atualizar opções.' : msg);
+                setEmailUiError(msg);
+                setEmailOptionsError(msg);
+                console.error('Erro ao carregar opções de e-mail', err);
             }
         }
 
@@ -676,8 +699,12 @@ $automationToken = config('app.automation_token', '');
             try {
                 return await res.json();
             } catch (err) {
-                const txt = await clone.text().catch(() => '');
-                throw new Error(txt || err.message || `Erro ${res.status}`);
+                const msg = err.message || 'Falha ao carregar opções.';
+                setEmailOptionsLoading(false, cached ? 'Usando cache. Falha ao atualizar opções.' : msg);
+                setEmailUiError(msg);
+                setEmailOptionsError(msg);
+                console.error('Erro ao carregar opções de e-mail', err);
+            }`);
             }
         }
 
@@ -801,7 +828,11 @@ $automationToken = config('app.automation_token', '');
             try {
                 localStorage.setItem(emailOptionsCacheKey, JSON.stringify({ ts: Date.now(), data }));
             } catch (err) {
-                console.warn('Falha ao salvar cache de opções de e-mail', err);
+                const msg = err.message || 'Falha ao carregar opções.';
+                setEmailOptionsLoading(false, cached ? 'Usando cache. Falha ao atualizar opções.' : msg);
+                setEmailUiError(msg);
+                setEmailOptionsError(msg);
+                console.error('Erro ao carregar opções de e-mail', err);
             }
         }
 
@@ -814,8 +845,11 @@ $automationToken = config('app.automation_token', '');
                 if (parsed.ts && Date.now() - parsed.ts > maxAgeMs) return null;
                 return parsed;
             } catch (err) {
-                console.warn('Falha ao ler cache de opções de e-mail', err);
-                return null;
+                const msg = err.message || 'Falha ao carregar opções.';
+                setEmailOptionsLoading(false, cached ? 'Usando cache. Falha ao atualizar opções.' : msg);
+                setEmailUiError(msg);
+                setEmailOptionsError(msg);
+                console.error('Erro ao carregar opções de e-mail', err);
             }
         }
 
@@ -823,6 +857,7 @@ $automationToken = config('app.automation_token', '');
             if (!data) return;
             if (data.error) {
                 setEmailUiError(data.error);
+                setEmailOptionsError(data.error);
                 return;
             }
             if (emailTemplate) {
@@ -884,6 +919,55 @@ $automationToken = config('app.automation_token', '');
             if (emailListInfo) emailListInfo.classList.remove('text-danger');
         }
 
+        function setEmailOptionsError(message) {
+            const msg = message || 'Falha ao carregar opções.';
+            if (emailTemplate) {
+                emailTemplate.innerHTML = '';
+                const opt = document.createElement('option');
+                opt.value = '';
+                opt.textContent = msg;
+                emailTemplate.appendChild(opt);
+            }
+            if (emailAccount) {
+                emailAccount.innerHTML = '';
+                const opt = document.createElement('option');
+                opt.value = '';
+                opt.textContent = msg;
+                emailAccount.appendChild(opt);
+            }
+            if (emailSource) {
+                emailSource.innerHTML = '';
+            }
+            if (emailListInfo) {
+                emailListInfo.textContent = msg;
+                emailListInfo.classList.add('text-danger');
+            }
+        }
+
+        function setEmailOptionsError(message) {
+            if (emailTemplate) {
+                emailTemplate.innerHTML = '';
+                const opt = document.createElement('option');
+                opt.value = '';
+                opt.textContent = message || 'Falha ao carregar templates';
+                emailTemplate.appendChild(opt);
+            }
+            if (emailAccount) {
+                emailAccount.innerHTML = '';
+                const opt = document.createElement('option');
+                opt.value = '';
+                opt.textContent = message || 'Falha ao carregar contas';
+                emailAccount.appendChild(opt);
+            }
+            if (emailSource) {
+                emailSource.innerHTML = '';
+            }
+            if (emailListInfo) {
+                emailListInfo.textContent = message || 'Falha ao carregar opções.';
+                emailListInfo.classList.add('text-danger');
+            }
+        }
+
         const emailOptionsEndpoints = Array.from(new Set([
             '<?= url('marketing/automations/email/options'); ?>',
             '/marketing/automations/email/options',
@@ -896,11 +980,13 @@ $automationToken = config('app.automation_token', '');
             }
         });
 
-        async function tryFetchEmailOptions() {
+                async function tryFetchEmailOptions() {
             const errors = [];
+            const tokenParam = automationToken ? `token=${encodeURIComponent(automationToken)}` : '';
             for (const endpoint of emailOptionsEndpoints) {
                 try {
-                    const data = await fetchJson(endpoint, { headers: { 'Accept': 'application/json' } });
+                    const url = tokenParam ? `${endpoint}?${tokenParam}` : endpoint;
+                    const data = await fetchJson(url, { headers: { 'Accept': 'application/json' } });
                     return { data, endpoint };
                 } catch (err) {
                     errors.push({ endpoint, message: err.message || String(err) });
@@ -910,7 +996,7 @@ $automationToken = config('app.automation_token', '');
             throw new Error(msgs || 'Falha ao carregar opções.');
         }
 
-        async function loadEmailOptions() {
+async function loadEmailOptions() {
             const cached = loadCachedEmailOptions();
             if (cached?.data) {
                 applyEmailOptions(cached.data);
@@ -932,10 +1018,110 @@ $automationToken = config('app.automation_token', '');
                 setEmailOptionsLoading(false, 'Pronto para agendar.');
                 console.info('Opções de e-mail carregadas de', endpoint);
             } catch (err) {
-                setEmailOptionsLoading(false, cached ? 'Usando cache. Falha ao atualizar opções.' : (err.message || 'Falha ao carregar opções.'));
-                setEmailUiError(err.message || 'erro ao carregar (veja console)');
+                const msg = err.message || 'Falha ao carregar opções.';
+                setEmailOptionsLoading(false, cached ? 'Usando cache. Falha ao atualizar opções.' : msg);
+                setEmailUiError(msg);
+                setEmailOptionsError(msg);
                 console.error('Erro ao carregar opções de e-mail', err);
             }
+        }
+
+        const emailStatusEndpoints = Array.from(new Set([
+            '<?= url('marketing/automations/email/status'); ?>',
+            '/marketing/automations/email/status',
+            '/public/marketing/automations/email/status',
+        ])).map((p) => {
+            try {
+                return new URL(p, window.location.origin).toString();
+            } catch (_) {
+                return p;
+            }
+        });
+
+        function getSelectedAccountId() {
+            if (!emailAccount || !emailAccount.value) {
+                return 0;
+            }
+            const parsed = parseInt(emailAccount.value, 10);
+            return Number.isFinite(parsed) ? parsed : 0;
+        }
+
+        function renderEmailStatus(payload) {
+            if (!emailStatusText || !emailLimitText) return;
+            if (!payload || payload.error) {
+                emailStatusText.textContent = payload?.error || 'Falha ao carregar status.';
+                emailStatusText.classList.add('text-danger');
+                emailLimitText.textContent = '';
+                if (emailBatchCard) emailBatchCard.style.display = 'none';
+                return;
+            }
+            const acc = payload.account || {};
+            const usage = acc.usage || {};
+            const limits = acc.limits || {};
+            const available = acc.available_budget ?? 0;
+            emailStatusText.classList.remove('text-danger');
+            const name = acc.name || 'Conta';
+            const hourSent = usage.hourly_sent ?? 0;
+            const daySent = usage.daily_sent ?? 0;
+            const hourLimit = limits.hourly || 0;
+            const dayLimit = limits.daily || 0;
+            const burst = limits.burst || 0;
+            const nextHour = usage.next_hour_reset ? formatTs(usage.next_hour_reset) : '-';
+            const nextDay = usage.next_day_reset ? formatTs(usage.next_day_reset) : '-';
+            const hourLabel = hourLimit || 'ilimitado';
+            const dayLabel = dayLimit || 'ilimitado';
+            const burstLabel = burst || 'ilimitado';
+            emailStatusText.textContent = `${name}: ${hourSent}/${hourLabel} na hora · ${daySent}/${dayLabel} no dia · burst ${burstLabel}`;
+            emailLimitText.textContent = available === 0
+                ? `Aguardando janela (próx hora: ${nextHour}, próx dia: ${nextDay}).`
+                : `Disponível agora: ${available} envios (próx hora: ${nextHour}, próx dia: ${nextDay}).`;
+
+            if (!emailBatchCard || !emailBatchList) return;
+            const campaigns = Array.isArray(payload.campaigns) ? payload.campaigns : [];
+            emailBatchList.innerHTML = '';
+            if (campaigns.length === 0) {
+                emailBatchCard.style.display = 'none';
+                return;
+            }
+            emailBatchCard.style.display = 'block';
+            const rows = [];
+            campaigns.forEach((camp) => {
+                const batches = Array.isArray(camp.batches) ? camp.batches : [];
+                batches.forEach((b) => {
+                    const badge = b.awaiting_window ? ' (aguardando janela)' : '';
+                    rows.push(`Campanha #${camp.id} (${camp.status}) · Lote #${b.id}: proc ${b.processed}/${b.total} · falhos ${b.failed} · pendentes ${b.remaining}${badge}`);
+                });
+            });
+            emailBatchList.textContent = rows.length > 0 ? rows.join('\n') : 'Sem lotes recentes.';
+        }
+
+        async function loadEmailStatus() {
+            const accountId = getSelectedAccountId();
+            const params = accountId > 0 ? `?account_id=${accountId}` : '';
+            const errors = [];
+            for (const endpoint of emailStatusEndpoints) {
+                const url = endpoint + params;
+                try {
+                    const data = await fetchJson(url, { headers: { 'Accept': 'application/json' } });
+                    renderEmailStatus(data);
+                    return;
+                } catch (err) {
+                const msg = err.message || 'Falha ao carregar opções.';
+                setEmailOptionsLoading(false, cached ? 'Usando cache. Falha ao atualizar opções.' : msg);
+                setEmailUiError(msg);
+                setEmailOptionsError(msg);
+                console.error('Erro ao carregar opções de e-mail', err);
+            }
+            }
+            renderEmailStatus({ error: errors.join(' | ') || 'Falha ao carregar status.' });
+        }
+
+        function scheduleEmailStatusRefresh(delayMs = 30000) {
+            if (emailStatusTimer) clearTimeout(emailStatusTimer);
+            emailStatusTimer = setTimeout(() => {
+                loadEmailStatus().catch(() => {});
+                scheduleEmailStatusRefresh(delayMs);
+            }, delayMs);
         }
 
         async function scheduleEmailAutomation() {
@@ -977,8 +1163,11 @@ $automationToken = config('app.automation_token', '');
                     emailScheduleStatus.textContent = `Agendado: ${res.recipients || 0} contatos · ${perHour}/h · início ${start} · fim estimado ${end}`;
                 }
             } catch (err) {
-                alert(err.message || 'Erro ao agendar/envio.');
-                if (emailScheduleStatus) emailScheduleStatus.textContent = err.message || 'Erro ao agendar.';
+                const msg = err.message || 'Falha ao carregar opções.';
+                setEmailOptionsLoading(false, cached ? 'Usando cache. Falha ao atualizar opções.' : msg);
+                setEmailUiError(msg);
+                setEmailOptionsError(msg);
+                console.error('Erro ao carregar opções de e-mail', err);
             } finally {
                 if (emailScheduleBtn) emailScheduleBtn.disabled = false;
             }
@@ -1014,7 +1203,11 @@ $automationToken = config('app.automation_token', '');
                     scheduleTime.value = d.toTimeString().slice(0, 5);
                 }
             } catch (err) {
-                setText(statusBox, err.message || 'Falha ao carregar status.');
+                const msg = err.message || 'Falha ao carregar opções.';
+                setEmailOptionsLoading(false, cached ? 'Usando cache. Falha ao atualizar opções.' : msg);
+                setEmailUiError(msg);
+                setEmailOptionsError(msg);
+                console.error('Erro ao carregar opções de e-mail', err);
             }
         }
 
@@ -1050,7 +1243,11 @@ $automationToken = config('app.automation_token', '');
                     renewalTime.value = d.toTimeString().slice(0, 5);
                 }
             } catch (err) {
-                setText(renewalStatusBox, err.message || 'Falha ao carregar status de renovação.');
+                const msg = err.message || 'Falha ao carregar opções.';
+                setEmailOptionsLoading(false, cached ? 'Usando cache. Falha ao atualizar opções.' : msg);
+                setEmailUiError(msg);
+                setEmailOptionsError(msg);
+                console.error('Erro ao carregar opções de e-mail', err);
             }
         }
 
@@ -1082,8 +1279,12 @@ $automationToken = config('app.automation_token', '');
                     appendLog(`Agendado para ${formatTs(data.scheduled_for)} (pacing ${payload.pacing_seconds}s).`);
                     await loadStatus();
                 } catch (err) {
-                    alert(err.message || 'Erro ao agendar.');
-                } finally {
+                const msg = err.message || 'Falha ao carregar opções.';
+                setEmailOptionsLoading(false, cached ? 'Usando cache. Falha ao atualizar opções.' : msg);
+                setEmailUiError(msg);
+                setEmailOptionsError(msg);
+                console.error('Erro ao carregar opções de e-mail', err);
+            } finally {
                     scheduleBtn.disabled = false;
                 }
             });
@@ -1118,9 +1319,12 @@ $automationToken = config('app.automation_token', '');
                     }
                     await loadStatus();
                 } catch (err) {
-                    alert(err.message || 'Erro ao rodar.');
-                    if (runModalStatus) runModalStatus.textContent = err.message || 'Erro ao rodar.';
-                } finally {
+                const msg = err.message || 'Falha ao carregar opções.';
+                setEmailOptionsLoading(false, cached ? 'Usando cache. Falha ao atualizar opções.' : msg);
+                setEmailUiError(msg);
+                setEmailOptionsError(msg);
+                console.error('Erro ao carregar opções de e-mail', err);
+            } finally {
                     runBtn.disabled = false;
                 }
             });
@@ -1143,8 +1347,12 @@ $automationToken = config('app.automation_token', '');
                     appendLog(`Simulação: ${res.total_candidates || 0} alvo(s), ${skipped} pulados. Nenhum envio realizado.`);
                     appendSchedule(appendLog, res.schedule || []);
                 } catch (err) {
-                    alert(err.message || 'Erro ao simular.');
-                } finally {
+                const msg = err.message || 'Falha ao carregar opções.';
+                setEmailOptionsLoading(false, cached ? 'Usando cache. Falha ao atualizar opções.' : msg);
+                setEmailUiError(msg);
+                setEmailOptionsError(msg);
+                console.error('Erro ao carregar opções de e-mail', err);
+            } finally {
                     runSimBtn.disabled = false;
                 }
             });
@@ -1165,8 +1373,12 @@ $automationToken = config('app.automation_token', '');
                     await downloadPdf('<?= url('marketing/automations/birthday/run'); ?>', payload, 'simulacao_aniversario.pdf');
                     appendLog('PDF simulado gerado (dry-run, sem envio).');
                 } catch (err) {
-                    alert(err.message || 'Erro ao gerar PDF.');
-                } finally {
+                const msg = err.message || 'Falha ao carregar opções.';
+                setEmailOptionsLoading(false, cached ? 'Usando cache. Falha ao atualizar opções.' : msg);
+                setEmailUiError(msg);
+                setEmailOptionsError(msg);
+                console.error('Erro ao carregar opções de e-mail', err);
+            } finally {
                     runSimPdfBtn.disabled = false;
                 }
             });
@@ -1185,9 +1397,12 @@ $automationToken = config('app.automation_token', '');
                     appendLog(`Automático ${autoToggle.checked ? 'ativado' : 'desativado'} (${payload.start_time}, ${payload.pacing_seconds}s).`);
                     await loadStatus();
                 } catch (err) {
-                    alert(err.message || 'Erro ao salvar automático.');
-                    autoToggle.checked = !autoToggle.checked;
-                } finally {
+                const msg = err.message || 'Falha ao carregar opções.';
+                setEmailOptionsLoading(false, cached ? 'Usando cache. Falha ao atualizar opções.' : msg);
+                setEmailUiError(msg);
+                setEmailOptionsError(msg);
+                console.error('Erro ao carregar opções de e-mail', err);
+            } finally {
                     autoToggle.disabled = false;
                 }
             });
@@ -1211,8 +1426,12 @@ $automationToken = config('app.automation_token', '');
                     appendRenewalLog(`Agendado renovação ${payload.scope} para ${formatTs(data.scheduled_for)} (pacing ${payload.pacing_seconds}s).`);
                     await loadRenewalStatus();
                 } catch (err) {
-                    alert(err.message || 'Erro ao agendar renovação.');
-                } finally {
+                const msg = err.message || 'Falha ao carregar opções.';
+                setEmailOptionsLoading(false, cached ? 'Usando cache. Falha ao atualizar opções.' : msg);
+                setEmailUiError(msg);
+                setEmailOptionsError(msg);
+                console.error('Erro ao carregar opções de e-mail', err);
+            } finally {
                     renewalScheduleBtn.disabled = false;
                 }
             });
@@ -1248,9 +1467,12 @@ $automationToken = config('app.automation_token', '');
                     }
                     await loadRenewalStatus();
                 } catch (err) {
-                    alert(err.message || 'Erro ao rodar renovação.');
-                    if (runModalStatus) runModalStatus.textContent = err.message || 'Erro ao rodar renovação.';
-                } finally {
+                const msg = err.message || 'Falha ao carregar opções.';
+                setEmailOptionsLoading(false, cached ? 'Usando cache. Falha ao atualizar opções.' : msg);
+                setEmailUiError(msg);
+                setEmailOptionsError(msg);
+                console.error('Erro ao carregar opções de e-mail', err);
+            } finally {
                     renewalRunBtn.disabled = false;
                 }
             });
@@ -1274,8 +1496,12 @@ $automationToken = config('app.automation_token', '');
                     appendRenewalLog(`Simulação (${payload.scope}): ${res.total_candidates || 0} alvo(s), ${skipped} pulados. Nenhum envio realizado.`);
                     appendSchedule(appendRenewalLog, res.schedule || []);
                 } catch (err) {
-                    alert(err.message || 'Erro ao simular renovação.');
-                } finally {
+                const msg = err.message || 'Falha ao carregar opções.';
+                setEmailOptionsLoading(false, cached ? 'Usando cache. Falha ao atualizar opções.' : msg);
+                setEmailUiError(msg);
+                setEmailOptionsError(msg);
+                console.error('Erro ao carregar opções de e-mail', err);
+            } finally {
                     renewalSimBtn.disabled = false;
                 }
             });
@@ -1297,8 +1523,12 @@ $automationToken = config('app.automation_token', '');
                     await downloadPdf('<?= url('marketing/automations/renewal/run'); ?>', payload, 'simulacao_renovacao.pdf');
                     appendRenewalLog('PDF simulado gerado (dry-run, sem envio).');
                 } catch (err) {
-                    alert(err.message || 'Erro ao gerar PDF de renovação.');
-                } finally {
+                const msg = err.message || 'Falha ao carregar opções.';
+                setEmailOptionsLoading(false, cached ? 'Usando cache. Falha ao atualizar opções.' : msg);
+                setEmailUiError(msg);
+                setEmailOptionsError(msg);
+                console.error('Erro ao carregar opções de e-mail', err);
+            } finally {
                     renewalSimPdfBtn.disabled = false;
                 }
             });
@@ -1313,6 +1543,18 @@ $automationToken = config('app.automation_token', '');
 
         if (emailSource) {
             emailSource.addEventListener('change', () => updateEmailSourceInfo(emailSource.value));
+        }
+
+        if (emailAccount) {
+            emailAccount.addEventListener('change', () => {
+                loadEmailStatus().catch(() => {});
+            });
+        }
+
+        if (emailStatusRefresh) {
+            emailStatusRefresh.addEventListener('click', () => {
+                loadEmailStatus().catch(() => {});
+            });
         }
 
         if (emailScheduleBtn) {
@@ -1352,8 +1594,12 @@ $automationToken = config('app.automation_token', '');
                     setBlockUi(Boolean(data.enabled), Number(data.window_hours || hours));
                     if (blockStatus) blockStatus.textContent = 'Configuração de bloqueio salva.';
                 } catch (err) {
-                    alert(err.message || 'Erro ao salvar bloqueio.');
-                } finally {
+                const msg = err.message || 'Falha ao carregar opções.';
+                setEmailOptionsLoading(false, cached ? 'Usando cache. Falha ao atualizar opções.' : msg);
+                setEmailUiError(msg);
+                setEmailOptionsError(msg);
+                console.error('Erro ao carregar opções de e-mail', err);
+            } finally {
                     blockSave.disabled = false;
                 }
             });
@@ -1373,9 +1619,12 @@ $automationToken = config('app.automation_token', '');
                     appendRenewalLog(`Automático renovação ${renewalAutoToggle.checked ? 'ativado' : 'desativado'} (${payload.scope}, ${payload.start_time}, ${payload.pacing_seconds}s).`);
                     await loadRenewalStatus();
                 } catch (err) {
-                    alert(err.message || 'Erro ao salvar automático de renovação.');
-                    renewalAutoToggle.checked = !renewalAutoToggle.checked;
-                } finally {
+                const msg = err.message || 'Falha ao carregar opções.';
+                setEmailOptionsLoading(false, cached ? 'Usando cache. Falha ao atualizar opções.' : msg);
+                setEmailUiError(msg);
+                setEmailOptionsError(msg);
+                console.error('Erro ao carregar opções de e-mail', err);
+            } finally {
                     renewalAutoToggle.disabled = false;
                 }
             });
@@ -1403,8 +1652,12 @@ $automationToken = config('app.automation_token', '');
                     setText(renewalForecastBox, line);
                     appendRenewalLog(line);
                 } catch (err) {
-                    alert(err.message || 'Erro ao prever fila.');
-                } finally {
+                const msg = err.message || 'Falha ao carregar opções.';
+                setEmailOptionsLoading(false, cached ? 'Usando cache. Falha ao atualizar opções.' : msg);
+                setEmailUiError(msg);
+                setEmailOptionsError(msg);
+                console.error('Erro ao carregar opções de e-mail', err);
+            } finally {
                     renewalForecastBtn.disabled = false;
                 }
             });
@@ -1414,5 +1667,11 @@ $automationToken = config('app.automation_token', '');
         loadRenewalStatus();
         loadBlockSettings();
         loadEmailOptions();
+        loadEmailStatus().catch(() => {});
+        scheduleEmailStatusRefresh();
     })();
 </script>
+
+
+
+

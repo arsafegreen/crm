@@ -175,6 +175,70 @@ final class ClientRepository
         return $row !== false ? $row : null;
     }
 
+    public function quickSearch(string $query, int $limit = 8, ?array $restrictedAvpNames = null, bool $allowOnline = false): array
+    {
+        $query = trim($query);
+        if ($query === '') {
+            return [];
+        }
+
+        $limit = max(1, min(50, $limit));
+        $params = [':limit' => $limit];
+
+        $normalized = mb_strtolower($query);
+        $docQuery = digits_only($query);
+
+        $clauses = ['LOWER(name) LIKE :qs', 'LOWER(titular_name) LIKE :qs'];
+        $params[':qs'] = '%' . $normalized . '%';
+
+        if ($docQuery !== '') {
+            $clauses[] = 'document LIKE :doc_qs';
+            $clauses[] = 'titular_document LIKE :doc_qs';
+            $params[':doc_qs'] = '%' . $docQuery . '%';
+        }
+
+        $clauses[] = 'EXISTS (SELECT 1 FROM client_protocols cp WHERE cp.client_id = clients.id AND LOWER(cp.protocol_number) LIKE :proto_qs)';
+        $params[':proto_qs'] = '%' . $normalized . '%';
+
+        $where = ['(' . implode(' OR ', $clauses) . ')', 'is_off = 0'];
+
+        $avpClause = $this->buildAvpAccessClause($restrictedAvpNames, $allowOnline, $params, 'avp_quick');
+        if ($avpClause !== null) {
+            $where[] = $avpClause;
+        }
+
+        $whereSql = $where ? 'WHERE ' . implode(' AND ', $where) : '';
+
+        $sql = 'SELECT id, name, document, titular_document, phone, whatsapp, extra_phones, status, last_certificate_expires_at
+                FROM clients
+                ' . $whereSql . '
+                ORDER BY updated_at DESC
+                LIMIT :limit';
+
+        $stmt = $this->pdo->prepare($sql);
+        foreach ($params as $key => $value) {
+            $stmt->bindValue($key, $value, is_int($value) ? PDO::PARAM_INT : PDO::PARAM_STR);
+        }
+        $stmt->bindValue(':limit', $limit, PDO::PARAM_INT);
+        $stmt->execute();
+
+        $rows = $stmt->fetchAll(PDO::FETCH_ASSOC) ?: [];
+
+        return array_map(static function (array $row): array {
+            $row['id'] = (int)($row['id'] ?? 0);
+            if (isset($row['last_certificate_expires_at'])) {
+                $row['last_certificate_expires_at'] = $row['last_certificate_expires_at'] !== null
+                    ? (int)$row['last_certificate_expires_at']
+                    : null;
+            }
+            if (isset($row['extra_phones']) && is_string($row['extra_phones'])) {
+                $decoded = json_decode($row['extra_phones'], true);
+                $row['extra_phones'] = is_array($decoded) ? $decoded : [];
+            }
+            return $row;
+        }, $rows);
+    }
+
     private function buildPhoneVariants(string $digits): array
     {
         $queue = [$digits];
@@ -552,6 +616,16 @@ final class ClientRepository
             $params[':expiration_date_end'] = $expirationDateEnd;
         }
 
+        $issueYear = (int)($filters['issue_year'] ?? 0);
+        if ($issueYear < 2020 || $issueYear > 2045) {
+            $issueYear = 0;
+        }
+
+        if ($issueYear > 0) {
+            $where[] = 'EXISTS (SELECT 1 FROM certificates cert WHERE cert.client_id = clients.id AND cert.start_at IS NOT NULL AND strftime("%Y", datetime(cert.start_at, "unixepoch", "localtime")) = :issue_year)';
+            $params[':issue_year'] = (string)$issueYear;
+        }
+
         $documentType = (string)($filters['document_type'] ?? '');
         if ($documentType === 'cpf') {
             $where[] = 'LENGTH(document) = 11';
@@ -619,6 +693,13 @@ final class ClientRepository
 
         $countSql = "SELECT COUNT(*) FROM clients {$whereSql}";
         $total = (int)$this->scalar($countSql, $params);
+
+        $documentCounts = ['cnpj' => 0, 'cpf' => 0];
+        $cnpjWhereSql = $whereSql === '' ? 'WHERE LENGTH(document) = 14' : $whereSql . ' AND LENGTH(document) = 14';
+        $cpfWhereSql = $whereSql === '' ? 'WHERE LENGTH(document) = 11' : $whereSql . ' AND LENGTH(document) = 11';
+
+        $documentCounts['cnpj'] = (int)$this->scalar("SELECT COUNT(*) FROM clients {$cnpjWhereSql}", $params);
+        $documentCounts['cpf'] = (int)$this->scalar("SELECT COUNT(*) FROM clients {$cpfWhereSql}", $params);
         $pages = $total > 0 ? (int)ceil($total / $perPage) : 1;
 
         return [
@@ -638,6 +719,7 @@ final class ClientRepository
                 'expiration_scope' => $expirationScope,
                 'expiration_year' => $expirationYear,
                 'expiration_date' => (string)($filters['expiration_date'] ?? ''),
+                'issue_year' => $issueYear,
                 'document_type' => $documentType,
                 'birthday_month' => $birthdayMonth,
                 'birthday_day' => $birthdayDay,
@@ -647,6 +729,7 @@ final class ClientRepository
             'meta' => [
                 'count' => count($data),
                 'total' => $total,
+                'document_counts' => $documentCounts,
             ],
         ];
     }

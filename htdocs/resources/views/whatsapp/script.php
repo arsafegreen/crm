@@ -105,6 +105,9 @@
     const notifySoundFeedback = document.querySelector('[data-notify-sound-feedback]');
     const notifySoundClearButton = document.querySelector('[data-notify-clear-sound]');
     const notifyTestSoundButton = document.querySelector('[data-notify-test-sound]');
+
+    // Monitor de disponibilidade dos gateways (toast único e elegante)
+    const gatewayFleetStatus = new Map();
     const lineForm = document.getElementById('wa-line-form');
     const lineReset = document.getElementById('wa-line-reset');
     const lineFeedback = document.getElementById('wa-line-feedback');
@@ -178,6 +181,8 @@
     const blockedBadge = document.querySelector('[data-blocked-badge]');
     const blockedBanner = document.querySelector('[data-blocked-banner]');
     const contactPhoneDisplay = document.querySelector('[data-contact-phone-display]');
+    const contactAvatar = document.querySelector('.wa-contact-avatar');
+    const contactNameHeading = document.querySelector('.wa-contact-identity h3');
     const noteForm = document.getElementById('wa-internal-form');
     const noteFeedback = document.getElementById('wa-note-feedback');
     const messagesContainer = document.getElementById('wa-messages');
@@ -202,9 +207,12 @@
             if (!slug) {
                 return null;
             }
+            const labelNode = card.querySelector('h4');
+            const qrPlaceholder = card.querySelector('[data-alt-gateway-qr-placeholder]');
             return {
                 kind: 'card',
                 slug,
+                label: labelNode ? (labelNode.textContent || slug) : slug,
                 isOnline: false,
                 card,
                 elements: {
@@ -212,10 +220,11 @@
                     refresh: card.querySelector('[data-alt-gateway-refresh]'),
                     qrButton: card.querySelector('[data-alt-gateway-qr]'),
                     qrOpen: card.querySelector('[data-alt-gateway-qr-popup]'),
-                    reset: card.querySelector('[data-alt-gateway-reset]'),
+                    clean: card.querySelector('[data-alt-gateway-clean]') || card.querySelector('[data-alt-gateway-reset]'),
                     start: card.querySelector('[data-alt-gateway-start]'),
                     feedback: card.querySelector('[data-alt-gateway-feedback]'),
                     qrPanel: card.querySelector('[data-alt-gateway-qr-panel]'),
+                    qrPlaceholder,
                     qrImage: card.querySelector('[data-alt-gateway-qr-image]'),
                     session: card.querySelector('[data-alt-gateway-session]'),
                     incoming: card.querySelector('[data-alt-gateway-incoming]'),
@@ -228,6 +237,10 @@
                 qrVisible: false,
                 qrTimer: null,
                 lastQrData: '',
+                qrResetAttempted: false,
+                qrAutoResetCount: 0,
+                lastResetAt: 0,
+                qrPlaceholderDefault: qrPlaceholder ? qrPlaceholder.textContent : '',
             };
         })
         .filter(Boolean);
@@ -245,6 +258,7 @@
             return {
                 kind: 'line',
                 slug,
+                label: wrapper.getAttribute('data-line-label') || slug,
                 isOnline: false,
                 wrapper,
                 label: wrapper.getAttribute('data-line-label') || '',
@@ -252,6 +266,7 @@
                 elements: {
                     status: wrapper.querySelector('[data-line-gateway-status]'),
                     start: wrapper.querySelector('[data-line-gateway-start]'),
+                    stop: wrapper.querySelector('[data-line-gateway-stop]'),
                     qrButton: wrapper.querySelector('[data-line-gateway-qr]'),
                     qrHistoryButton: wrapper.querySelector('[data-line-gateway-qr-history]'),
                 },
@@ -441,11 +456,17 @@
     const registerContactEmail = registerContactForm ? registerContactForm.querySelector('input[name="contact_email"]') : null;
     const registerContactAddress = registerContactForm ? registerContactForm.querySelector('textarea[name="contact_address"]') : null;
     const registerContactClientId = registerContactForm ? registerContactForm.querySelector('input[name="client_id"]') : null;
+    const registerClientSearchInput = registerContactModal ? registerContactModal.querySelector('[data-register-client-search]') : null;
+    const registerClientSearchButton = registerContactModal ? registerContactModal.querySelector('[data-register-client-search-btn]') : null;
+    const registerClientSearchResults = registerContactModal ? registerContactModal.querySelector('[data-register-client-search-results]') : null;
+    const registerClientSearchFeedback = registerContactModal ? registerContactModal.querySelector('[data-register-client-search-feedback]') : null;
     let registerContactBodyOverflow = '';
     let registerContactTrigger = null;
     const threadSearchInput = document.querySelector('[data-thread-search-input]');
     const threadSearchClear = document.querySelector('[data-thread-search-clear]');
+    const threadSearchApply = document.querySelector('[data-thread-search-apply]');
     const threadSearchFeedback = document.querySelector('[data-thread-search-feedback]');
+    let threadSearchRefreshTimer = null;
     const lineQrModal = document.querySelector('[data-line-qr-modal]');
     const lineQrModeLabel = lineQrModal ? lineQrModal.querySelector('[data-line-qr-mode]') : null;
     const lineQrTitle = lineQrModal ? lineQrModal.querySelector('[data-line-qr-title]') : null;
@@ -696,6 +717,217 @@
             return `(${digits.substr(0, 2)}) ${digits.substr(2, 4)}-${digits.substr(6)}`;
         }
         return phone;
+    }
+
+    function deriveInitials(name) {
+        const safe = (name || '').trim();
+        if (safe === '') {
+            return 'C';
+        }
+        const parts = safe.split(/\s+/).filter(Boolean);
+        const initials = parts.slice(0, 2).map((part) => part.charAt(0).toUpperCase());
+        const joined = initials.join('').slice(0, 2);
+        return joined !== '' ? joined : 'C';
+    }
+
+    function resolveContactPhotoUrl(contact, metadata) {
+        const safeMeta = metadata || {};
+        const snapshot = (safeMeta.gateway_snapshot && typeof safeMeta.gateway_snapshot === 'object')
+            ? safeMeta.gateway_snapshot
+            : {};
+        const candidates = [
+            safeMeta.profile_photo,
+            snapshot.profile_photo,
+            contact && contact.profile_photo,
+        ].map((value) => (typeof value === 'string' ? value.trim() : ''));
+
+        for (const candidate of candidates) {
+            if (candidate && (/^https?:\/\//i.test(candidate) || candidate.startsWith('data:') || candidate.startsWith('blob:'))) {
+                return candidate;
+            }
+        }
+
+        return '';
+    }
+
+    function renderContactProfileCard(contact, metadata) {
+        if (!contactProfileCard) {
+            return;
+        }
+        const safeMetadata = normalizeMetadata(metadata);
+        const gatewaySnapshot = (safeMetadata.gateway_snapshot && typeof safeMetadata.gateway_snapshot === 'object')
+            ? safeMetadata.gateway_snapshot
+            : {};
+        const photoUrl = resolveContactPhotoUrl(contact, safeMetadata);
+        const name = (safeMetadata.profile && String(safeMetadata.profile).trim())
+            || contact.name
+            || activeThreadContext.name
+            || 'Contato WhatsApp';
+        const rawPhone = contact.phone || activeThreadContext.phone || '';
+        const phoneDisplay = rawPhone ? formatPhone(rawPhone) : '';
+        const rawFrom = (safeMetadata.raw_from || '').toString();
+        const normalizedFromDigits = normalizePhone(safeMetadata.normalized_from || '');
+        const phoneDigits = normalizePhone(rawPhone);
+        const normalizedFromDisplay = normalizedFromDigits ? formatPhone(normalizedFromDigits) : '';
+        const gatewaySource = (gatewaySnapshot.source || '').toString();
+        const capturedAtRaw = Number(gatewaySnapshot.captured_at || 0);
+        const capturedAtMs = capturedAtRaw > 0 && capturedAtRaw < 2000000000 ? capturedAtRaw * 1000 : capturedAtRaw;
+        const capturedLabel = capturedAtMs > 0 ? formatMessageTimestamp(capturedAtMs) : '';
+        const email = (safeMetadata.email || '').toString();
+        const cpf = (safeMetadata.cpf || '').toString();
+        const tagsRaw = Array.isArray(safeMetadata.tags)
+            ? safeMetadata.tags
+            : (typeof safeMetadata.tags === 'string' ? safeMetadata.tags.split(',') : []);
+        const tags = tagsRaw.map((tag) => (tag || '').toString().trim()).filter(Boolean);
+        const metaMessageId = (gatewaySnapshot.meta_message_id || '').toString();
+        const presence = (gatewaySnapshot.presence || '').toString();
+        const about = (gatewaySnapshot.about || '').toString();
+        const businessName = (gatewaySnapshot.business_name || gatewaySnapshot.verified_name || '').toString();
+        const businessCategory = (gatewaySnapshot.business_category || '').toString();
+        const verifiedLevel = (gatewaySnapshot.verified_level || '').toString();
+        const lastSeenRaw = Number(gatewaySnapshot.last_seen_at || 0);
+        const lastSeenMs = lastSeenRaw > 0 && lastSeenRaw < 2000000000 ? lastSeenRaw * 1000 : lastSeenRaw;
+        const lastSeenLabel = lastSeenMs > 0 ? formatMessageTimestamp(lastSeenMs) : '';
+
+        const avatarHtml = photoUrl
+            ? `<img src="${escapeHtml(photoUrl)}" alt="Foto do contato" style="width:54px;height:54px;border-radius:50%;object-fit:cover;border:1px solid rgba(148,163,184,0.25);" />`
+            : `<div style="width:54px;height:54px;border-radius:50%;background:rgba(148,163,184,0.2);display:flex;align-items:center;justify-content:center;color:#e2e8f0;font-weight:700;font-size:1.1rem;">${escapeHtml(deriveInitials(name).slice(0, 1))}</div>`;
+
+        const identityParts = [
+            phoneDisplay ? `<span style="color:var(--muted);font-size:0.92rem;">Telefone: ${escapeHtml(phoneDisplay)}</span>` : '',
+            rawFrom ? `<span style="color:rgba(148,163,184,0.8);font-size:0.86rem;">Origem: ${escapeHtml(rawFrom)}</span>` : '',
+            normalizedFromDisplay && normalizedFromDigits !== phoneDigits
+                ? `<span style="color:rgba(148,163,184,0.8);font-size:0.86rem;">Normalizado: ${escapeHtml(normalizedFromDisplay)}</span>`
+                : '',
+            gatewaySource ? `<span style="color:rgba(148,163,184,0.8);font-size:0.86rem;">Gateway: ${escapeHtml(gatewaySource)}</span>` : '',
+            capturedLabel ? `<span style="color:rgba(148,163,184,0.8);font-size:0.86rem;">Capturado: ${escapeHtml(capturedLabel)}</span>` : '',
+        ].filter(Boolean);
+
+        const detailBlocks = [];
+        if (email) {
+            detailBlocks.push(`<div><strong style="color:var(--muted);font-size:0.82rem;">E-mail</strong><div>${escapeHtml(email)}</div></div>`);
+        }
+        if (cpf) {
+            detailBlocks.push(`<div><strong style="color:var(--muted);font-size:0.82rem;">Documento</strong><div>${escapeHtml(cpf)}</div></div>`);
+        }
+        if (tags.length) {
+            detailBlocks.push(`<div><strong style="color:var(--muted);font-size:0.82rem;">Tags</strong><div>${escapeHtml(tags.join(', '))}</div></div>`);
+        }
+        if (metaMessageId) {
+            detailBlocks.push(`<div><strong style="color:var(--muted);font-size:0.82rem;">Ult. meta_message_id</strong><div>${escapeHtml(metaMessageId)}</div></div>`);
+        }
+        if (presence) {
+            detailBlocks.push(`<div><strong style="color:var(--muted);font-size:0.82rem;">Presença</strong><div>${escapeHtml(presence)}</div></div>`);
+        }
+        if (about) {
+            detailBlocks.push(`<div><strong style="color:var(--muted);font-size:0.82rem;">Sobre</strong><div>${escapeHtml(about)}</div></div>`);
+        }
+        if (businessName) {
+            const suffix = verifiedLevel ? ` (${escapeHtml(verifiedLevel)})` : '';
+            detailBlocks.push(`<div><strong style="color:var(--muted);font-size:0.82rem;">Business</strong><div>${escapeHtml(businessName)}${suffix}</div></div>`);
+        }
+        if (businessCategory) {
+            detailBlocks.push(`<div><strong style="color:var(--muted);font-size:0.82rem;">Categoria</strong><div>${escapeHtml(businessCategory)}</div></div>`);
+        }
+        if (lastSeenLabel) {
+            detailBlocks.push(`<div><strong style="color:var(--muted);font-size:0.82rem;">Visto por último</strong><div>${escapeHtml(lastSeenLabel)}</div></div>`);
+        }
+
+        const detailsGrid = detailBlocks.length
+            ? `<div style="margin-top:10px;display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;">${detailBlocks.join('')}</div>`
+            : '';
+
+        contactProfileCard.innerHTML = `
+            <div style="display:flex;align-items:center;gap:12px;">
+                ${avatarHtml}
+                <div style="display:flex;flex-direction:column;gap:4px;min-width:0;">
+                    <strong style="color:var(--text);font-size:1rem;">${escapeHtml(name)}</strong>
+                    ${identityParts.join('')}
+                </div>
+            </div>
+            ${detailsGrid}
+        `;
+    }
+
+    function applyContactPayload(contact) {
+        if (!contact || typeof contact !== 'object') {
+            return;
+        }
+        const metadata = normalizeMetadata(contact.metadata);
+        const name = (metadata.profile && String(metadata.profile).trim())
+            || contact.name
+            || activeThreadContext.name
+            || 'Contato WhatsApp';
+        const rawPhone = contact.phone || activeThreadContext.phone || '';
+        const phoneDisplay = rawPhone ? formatPhone(rawPhone) : '';
+        const photoUrl = resolveContactPhotoUrl(contact, metadata);
+
+        activeThreadContext.name = name;
+        activeThreadContext.phone = rawPhone || activeThreadContext.phone || '';
+        activeContactDigits = normalizePhone(activeThreadContext.phone || '');
+
+        if (contactNameHeading) {
+            contactNameHeading.textContent = name;
+        }
+
+        const phoneRow = document.querySelector('.wa-contact-identity .wa-contact-row');
+        let phoneNode = contactPhoneDisplay || document.querySelector('.wa-contact-identity [data-contact-phone-display]');
+        if (!phoneNode && phoneRow) {
+            phoneNode = document.createElement('span');
+            phoneNode.className = 'wa-contact-phone';
+            phoneNode.dataset.contactPhoneDisplay = '';
+            phoneRow.appendChild(phoneNode);
+        }
+        if (phoneNode) {
+            phoneNode.textContent = phoneDisplay;
+            phoneNode.hidden = phoneDisplay === '';
+        }
+
+        if (editContactButton) {
+            editContactButton.dataset.contactName = name;
+            editContactButton.dataset.contactPhone = rawPhone || phoneDisplay;
+        }
+
+        if (contactAvatar) {
+            const initials = deriveInitials(name);
+            let img = contactAvatar.querySelector('img');
+            let initialsNode = contactAvatar.querySelector('span');
+            if (photoUrl) {
+                if (!img) {
+                    img = document.createElement('img');
+                    img.loading = 'lazy';
+                    img.decoding = 'async';
+                    contactAvatar.prepend(img);
+                }
+                img.src = photoUrl;
+                img.alt = 'Foto do contato';
+                contactAvatar.classList.add('has-photo');
+                if (initialsNode) {
+                    initialsNode.textContent = initials;
+                    initialsNode.style.display = 'none';
+                }
+            } else {
+                if (img) {
+                    img.remove();
+                }
+                if (!initialsNode) {
+                    initialsNode = document.createElement('span');
+                    contactAvatar.appendChild(initialsNode);
+                }
+                initialsNode.textContent = initials;
+                initialsNode.style.display = '';
+                contactAvatar.classList.remove('has-photo');
+            }
+        }
+
+        if (contactProfileToggle) {
+            contactProfileToggle.dataset.contactProfileName = name;
+            contactProfileToggle.dataset.contactPhone = phoneDisplay || rawPhone;
+            contactProfileToggle.dataset.contactPhoto = photoUrl || '';
+        }
+
+        renderContactProfileCard({ name, phone: rawPhone, profile_photo: photoUrl }, metadata);
+        setBlockedState(activeContactDigits !== '' && blockedNumbersSet.has(activeContactDigits));
     }
 
     function setBlockedState(isBlocked, updatedList = null) {
@@ -975,6 +1207,15 @@
         if (threadSearchClear) {
             threadSearchClear.hidden = query === '';
         }
+    }
+
+    function scheduleThreadSearchRefresh(delay = 120) {
+        if (threadSearchRefreshTimer) {
+            clearTimeout(threadSearchRefreshTimer);
+        }
+        threadSearchRefreshTimer = setTimeout(() => {
+            refreshPanels({ skipNotifications: true });
+        }, Math.max(50, delay));
     }
 
     async function postForm(url, payload) {
@@ -2779,6 +3020,9 @@
                 incomingMessages.forEach((message) => appendMessageBubble(message));
                 scrollMessagesToBottom();
             }
+            if (payload && payload.contact) {
+                applyContactPayload(payload.contact);
+            }
             if (payload) {
                 const unreadFromServer = Number(payload.thread_unread ?? payload.thread?.unread_count ?? 0);
                 clearActiveThreadUnread(unreadFromServer);
@@ -2925,6 +3169,9 @@
         if (threadId) {
             params.set('thread', String(threadId));
         }
+        if (threadSearchInput && threadSearchInput.value) {
+            params.set('search', threadSearchInput.value);
+        }
         return `${panelRefreshEndpoint}?${params.toString()}`;
     }
 
@@ -2970,7 +3217,11 @@
                 persistPanelCache(data.panels);
             }
         } catch (error) {
-            console.error('Erro ao atualizar filas:', error);
+            if (error && error.name === 'AbortError') {
+                // Solicitação cancelada por nova busca; ignora sem exibir erro.
+            } else {
+                console.error('Erro ao atualizar filas:', error);
+            }
         } finally {
             isPanelRefreshing = false;
             panelRefreshController = null;
@@ -3216,14 +3467,18 @@
         const emptyState = document.querySelector(`[data-panel-empty="${panelKey}"]`);
         const countChip = document.querySelector(`[data-panel-count="${panelKey}"]`);
         const items = Array.isArray(panelData.items) ? panelData.items : null;
+
         if (list) {
             if (panelData.html) {
-                list.innerHTML = panelData.html;
-                list.hidden = !panelData.html;
-            } else if (items) {
-                renderPanelItems(list, items);
+                renderPanelHtmlChunked(list, panelData.html, { batchSize: 4 });
+            } else if (items && items.length > 0) {
+                renderPanelItems(list, items, { batchSize: 1 });
+            } else {
+                list.innerHTML = '';
+                list.hidden = true;
             }
         }
+
         if (emptyState) {
             const hasContent = items ? items.length > 0 : Boolean(panelData.html && panelData.html !== '');
             emptyState.hidden = hasContent;
@@ -3234,6 +3489,31 @@
         if (countChip && typeof panelData.count !== 'undefined') {
             countChip.textContent = `${panelData.count} contatos`;
         }
+    }
+
+    function renderPanelHtmlChunked(list, html, options = {}) {
+        const batchSize = Number(options.batchSize || 8);
+        const container = document.createElement('div');
+        container.innerHTML = html;
+        const nodes = Array.from(container.children);
+        list.innerHTML = '';
+        list.hidden = nodes.length === 0;
+
+        let index = 0;
+        const total = nodes.length;
+
+        const step = () => {
+            const frag = document.createDocumentFragment();
+            for (let i = 0; i < batchSize && index < total; i += 1, index += 1) {
+                frag.appendChild(nodes[index]);
+            }
+            list.appendChild(frag);
+            if (index < total) {
+                requestAnimationFrame(step);
+            }
+        };
+
+        requestAnimationFrame(step);
     }
 
     function registerPanelMeta(panelKey, entries, options = {}) {
@@ -3442,77 +3722,90 @@
         return Date.now() - lastResponse >= cooldownMs;
     }
 
-    function triggerNotification(meta, options = {}) {
-        if (!meta || (!notificationState.soundEnabled && !notificationState.popupEnabled)) {
+    function renderPanelItems(list, items, options = {}) {
+        if (!list || !Array.isArray(items)) {
             return;
         }
-        if (options.isActiveThread && !shouldNotifyActiveThread(meta.id)) {
-            return;
-        }
-        if (notificationState.soundEnabled) {
-            playNotificationSound(meta);
-        }
-        if (notificationState.popupEnabled) {
-            showNotificationToast(meta);
-        }
-    }
+        const activeId = threadId;
+        const batchSize = Number(options.batchSize || 1);
+        list.innerHTML = '';
+        list.hidden = items.length === 0;
 
-    function playNotificationSound(meta = {}) {
-        if (!notificationState.soundEnabled) {
-            return;
-        }
-        const style = notificationState.soundStyle || 'voice';
-        if (style === 'custom') {
-            if (notificationState.customSoundData) {
-                tryPlayCustomAudio(notificationState.customSoundData);
-            } else {
-                setSoundFeedback('Selecione um áudio para usar como alerta personalizado.', true);
-                playFallbackTone();
+        let index = 0;
+        const total = items.length;
+
+        const step = () => {
+            const frag = document.createDocumentFragment();
+            for (let i = 0; i < batchSize && index < total; i += 1, index += 1) {
+                const item = items[index];
+                if (!item || !item.id) {
+                    continue;
+                }
+                const el = document.createElement('div');
+                el.className = 'wa-mini-thread';
+                el.setAttribute('data-thread-id', String(item.id));
+                if (item.queue) {
+                    el.setAttribute('data-queue', item.queue);
+                }
+                const title = document.createElement('div');
+                title.className = 'wa-mini-thread__title';
+                title.textContent = item.contact_name || item.contact_phone || 'Contato';
+                const subtitle = document.createElement('div');
+                subtitle.className = 'wa-mini-thread__meta';
+                const parts = [];
+                if (item.line_label) {
+                    parts.push(item.line_label);
+                }
+                if (item.last_message_preview) {
+                    parts.push(item.last_message_preview);
+                }
+                subtitle.textContent = parts.join(' · ');
+
+                const unread = document.createElement('div');
+                unread.className = 'wa-mini-thread__unread';
+                const unreadCount = Number(item.unread || 0);
+                if (unreadCount > 0) {
+                    unread.textContent = `+${unreadCount}`;
+                } else {
+                    unread.classList.add('is-zero');
+                }
+
+                el.appendChild(title);
+                el.appendChild(subtitle);
+                el.appendChild(unread);
+
+                if (activeId && item.id === activeId) {
+                    el.classList.add('is-active');
+                }
+
+                el.addEventListener('click', () => {
+                    if (threadNavigationLocked) {
+                        return;
+                    }
+                    threadNavigationLocked = true;
+                    setTimeout(() => {
+                        threadNavigationLocked = false;
+                    }, 800);
+                    stopPanelRefreshLoop();
+                    pauseThreadPolling();
+
+                    const href = document.querySelector(`[data-thread-link="${item.id}"]`);
+                    if (href && href.getAttribute('href')) {
+                        window.location.href = href.getAttribute('href');
+                    }
+                });
+
+                frag.appendChild(el);
             }
-            return;
-        }
-        if (style === 'beep') {
-            playFallbackTone();
-            return;
-        }
-        if (style === 'voice') {
-            if (playSpeechNotification(meta)) {
-                return;
+
+            list.appendChild(frag);
+            if (index < total) {
+                requestAnimationFrame(step);
             }
-            playFallbackTone();
-            return;
-        }
-        playFallbackTone();
-    }
+        };
 
-    function playSpeechNotification(meta = {}) {
-        if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
-            return false;
-        }
-        const descriptionParts = ['Temos uma nova mensagem'];
-        if (meta.line_label) {
-            descriptionParts.push('na linha ' + meta.line_label);
-        }
-        if (meta.name) {
-            descriptionParts.push('de ' + meta.name);
-        }
-        const spokenText = descriptionParts.join(' ');
-        try {
-            const utterance = new SpeechSynthesisUtterance(spokenText);
-            utterance.lang = 'pt-BR';
-            window.speechSynthesis.cancel();
-            window.speechSynthesis.speak(utterance);
-            return true;
-        } catch (error) {
-            return false;
-        }
+        requestAnimationFrame(step);
     }
-
-    function playFallbackTone() {
-        const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
-        if (!AudioContextCtor) {
-            return;
-        }
         if (!notificationState.audioCtx) {
             notificationState.audioCtx = new AudioContextCtor();
         }
@@ -3581,6 +3874,50 @@
         }
         const timer = setTimeout(() => closeToast(toast), 9000);
         toastTimers.set(toast, timer);
+    }
+
+    function renderGatewayOfflineToast() {
+        if (!toastStack) {
+            return;
+        }
+        const offline = Array.from(gatewayFleetStatus.values()).filter((entry) => entry.online === false);
+        const existing = toastStack.querySelector('[data-toast-gateway]');
+        if (offline.length === 0) {
+            if (existing) {
+                existing.remove();
+            }
+            if (!toastStack.children.length) {
+                toastStack.hidden = true;
+            }
+            return;
+        }
+
+        const labels = offline.map((entry) => entry.label || entry.slug || 'Gateway').join(', ');
+        const toast = existing || document.createElement('article');
+        toast.className = 'wa-toast wa-toast--alert';
+        toast.dataset.toastGateway = 'offline';
+        toast.innerHTML = `
+            <div class="wa-toast__header">
+                <div>
+                    <small class="wa-toast__line">Gateways</small>
+                    <strong class="wa-toast__title">Gateway offline</strong>
+                    <small class="wa-toast__line">${escapeHtml(labels)}</small>
+                </div>
+                <button type="button" class="wa-toast__close" aria-label="Fechar" data-toast-close>&times;</button>
+            </div>
+            <p class="wa-toast__preview">Verifique ou reinicie o(s) gateway(s) listado(s).</p>
+        `;
+        toast.querySelector('[data-toast-close]').addEventListener('click', (event) => {
+            event.stopPropagation();
+            toast.remove();
+            if (!toastStack.children.length) {
+                toastStack.hidden = true;
+            }
+        });
+        if (!existing) {
+            toastStack.prepend(toast);
+        }
+        toastStack.hidden = false;
     }
 
     function closeToast(toast) {
@@ -4306,12 +4643,156 @@
             if (registerContactFeedback) {
                 registerContactFeedback.textContent = '';
             }
+            if (registerClientSearchInput) {
+                registerClientSearchInput.value = '';
+            }
+            if (registerClientSearchResults) {
+                registerClientSearchResults.innerHTML = '';
+                registerClientSearchResults.style.display = 'none';
+            }
+            if (registerClientSearchFeedback) {
+                registerClientSearchFeedback.textContent = '';
+            }
         };
 
         openRegisterContactFromTrigger = (trigger) => {
             registerContactTrigger = trigger || null;
             preloadRegisterForm(trigger || registerContactTrigger);
             openRegisterContactModal();
+        };
+
+        const registerClientSearchEndpoint = '<?= url('crm/clients/quick-search'); ?>';
+
+        const applyRegisterClientSelection = (item) => {
+            const phoneCandidate = normalizePhone(
+                item.whatsapp
+                || item.phone
+                || (Array.isArray(item.extra_phones) && item.extra_phones.length ? item.extra_phones[0] : '')
+                || ''
+            );
+            const cpfCandidate = normalizePhone(
+                item.titular_document
+                || (item.document && String(item.document).length === 11 ? item.document : '')
+                || ''
+            );
+
+            if (registerContactName && item.name) {
+                registerContactName.value = item.name;
+            }
+            if (registerContactPhone && phoneCandidate) {
+                registerContactPhone.value = phoneCandidate;
+            }
+            if (registerContactCpf && cpfCandidate) {
+                registerContactCpf.value = cpfCandidate;
+            }
+            if (registerContactClientId) {
+                registerContactClientId.value = item.id ? String(item.id) : '';
+            }
+            if (registerContactFeedback) {
+                registerContactFeedback.textContent = 'Cliente carregado do CRM.';
+            }
+            if (registerClientSearchResults) {
+                registerClientSearchResults.style.display = 'none';
+            }
+        };
+
+        const renderRegisterClientResults = (items) => {
+            if (!registerClientSearchResults) {
+                return;
+            }
+            registerClientSearchResults.innerHTML = '';
+            if (!Array.isArray(items) || items.length === 0) {
+                registerClientSearchResults.style.display = 'none';
+                return;
+            }
+
+            const list = document.createElement('ul');
+            list.style.listStyle = 'none';
+            list.style.margin = '0';
+            list.style.padding = '0';
+
+            items.forEach((item, index) => {
+                const li = document.createElement('li');
+                li.style.borderBottom = index === items.length - 1 ? 'none' : '1px solid var(--border)';
+                li.style.padding = '6px';
+
+                const button = document.createElement('button');
+                button.type = 'button';
+                button.style.width = '100%';
+                button.style.textAlign = 'left';
+                button.style.border = 'none';
+                button.style.background = 'transparent';
+                button.style.color = 'var(--text)';
+                button.style.cursor = 'pointer';
+
+                const docLabel = item.document_formatted
+                    || item.document
+                    || item.titular_document_formatted
+                    || item.titular_document
+                    || '';
+                const phoneCandidate = normalizePhone(
+                    item.whatsapp
+                    || item.phone
+                    || (Array.isArray(item.extra_phones) && item.extra_phones.length ? item.extra_phones[0] : '')
+                    || ''
+                );
+                const phoneLabel = phoneCandidate ? formatPhone(phoneCandidate) : '';
+
+                button.textContent = [item.name || 'Cliente', docLabel, phoneLabel].filter(Boolean).join(' • ');
+                button.addEventListener('click', () => applyRegisterClientSelection(item));
+
+                li.appendChild(button);
+                list.appendChild(li);
+            });
+
+            registerClientSearchResults.appendChild(list);
+            registerClientSearchResults.style.display = 'block';
+        };
+
+        const performRegisterClientSearch = async () => {
+            if (!registerClientSearchInput) {
+                return;
+            }
+            const query = registerClientSearchInput.value.trim();
+            if (query.length < 2) {
+                if (registerClientSearchFeedback) {
+                    registerClientSearchFeedback.textContent = 'Digite pelo menos 2 caracteres para buscar.';
+                }
+                renderRegisterClientResults([]);
+                return;
+            }
+
+            if (registerClientSearchFeedback) {
+                registerClientSearchFeedback.textContent = 'Buscando...';
+            }
+            renderRegisterClientResults([]);
+
+            try {
+                const url = new URL(registerClientSearchEndpoint, window.location.origin);
+                url.searchParams.set('q', query);
+                url.searchParams.set('limit', '8');
+
+                const response = await fetch(url.toString(), {
+                    headers: { Accept: 'application/json' },
+                    credentials: 'same-origin',
+                });
+                const data = await response.json().catch(() => ({}));
+                if (!response.ok) {
+                    throw new Error(data.error || 'Não foi possível buscar clientes.');
+                }
+                const items = Array.isArray(data.items) ? data.items : [];
+                renderRegisterClientResults(items);
+                if (registerClientSearchFeedback) {
+                    registerClientSearchFeedback.textContent = items.length > 0
+                        ? `${items.length} resultado(s) encontrado(s).`
+                        : 'Nenhum cliente encontrado.';
+                }
+            } catch (error) {
+                if (registerClientSearchFeedback) {
+                    registerClientSearchFeedback.textContent = error.message || 'Falha ao buscar clientes.';
+                }
+                renderRegisterClientResults([]);
+            }
         };
 
         async function lookupClientByCpf() {
@@ -4352,6 +4833,24 @@
 
         if (registerContactCpf) {
             registerContactCpf.addEventListener('blur', lookupClientByCpf);
+        }
+
+        if (registerClientSearchButton) {
+            registerClientSearchButton.addEventListener('click', performRegisterClientSearch);
+        }
+        if (registerClientSearchInput) {
+            registerClientSearchInput.addEventListener('keydown', (event) => {
+                if (event.key === 'Enter') {
+                    event.preventDefault();
+                    performRegisterClientSearch();
+                }
+            });
+            registerClientSearchInput.addEventListener('input', () => {
+                if (registerClientSearchFeedback) {
+                    registerClientSearchFeedback.textContent = '';
+                }
+                renderRegisterClientResults([]);
+            });
         }
 
         registerContactForm.addEventListener('submit', async (event) => {
@@ -4600,13 +5099,20 @@
             const metrics = gateway.metrics || {};
             const normalized = String(gateway.status || '').toLowerCase();
             const translatedStatus = translateGatewayStatus(gateway.status || 'Gateway operacional');
-            const isReady = normalized.includes('connected') || normalized.includes('ready');
+            const isReady = Boolean(gateway.ready)
+                || normalized.includes('connected')
+                || normalized.includes('ready')
+                || normalized.includes('online')
+                || normalized.includes('open');
             state.isOnline = isReady;
+            gatewayFleetStatus.set(state.slug, { slug: state.slug, label: state.label || state.slug, online: isReady });
             if (elements.start) {
-                elements.start.textContent = isReady ? 'Parar gateway' : 'Iniciar gateway';
-                elements.start.dataset.gatewayAction = isReady ? 'stop' : 'start';
-                elements.start.classList.toggle('is-online', isReady);
-                elements.start.classList.toggle('is-offline', !isReady);
+                // Mantém o botão de start sempre como iniciar (paramos via botão dedicado).
+                elements.start.textContent = 'Iniciar gateway';
+                elements.start.dataset.gatewayAction = 'start';
+                elements.start.classList.remove('is-stop');
+                elements.start.classList.remove('is-online');
+                elements.start.classList.add('is-offline');
             }
             elements.status.textContent = translatedStatus;
             if (elements.session) {
@@ -4651,6 +5157,7 @@
             if (state.qrVisible && normalized.indexOf('qr') === -1) {
                 hideGatewayQr(state, true);
             }
+            renderGatewayOfflineToast();
         } catch (error) {
             if (elements.status) {
                 elements.status.textContent = error.message || 'Erro ao consultar gateway';
@@ -4662,6 +5169,8 @@
                 elements.start.classList.remove('is-online');
                 elements.start.classList.add('is-offline');
             }
+            gatewayFleetStatus.set(state.slug, { slug: state.slug, label: state.label || state.slug, online: false });
+            renderGatewayOfflineToast();
         }
     }
 
@@ -4680,7 +5189,11 @@
             ? 'Gateway sendo encerrado... aguarde alguns segundos.'
             : 'Gateway em inicializacao...';
 
+        const originalText = button.textContent;
         button.disabled = true;
+        button.classList.add('is-busy');
+        button.setAttribute('aria-busy', 'true');
+        button.textContent = waitingText;
         if (statusElement) {
             statusElement.textContent = waitingText;
         }
@@ -4692,6 +5205,7 @@
             if (!wantsStop && showQrOnStart) {
                 showGatewayQr(state, false);
             }
+            state.isOnline = !wantsStop;
             const delay = wantsStop ? 3500 : 1500;
             setTimeout(() => {
                 refreshGatewayStatus(state);
@@ -4703,6 +5217,57 @@
             }
         } finally {
             button.disabled = false;
+            button.classList.remove('is-busy');
+            button.removeAttribute('aria-busy');
+            if (originalText) {
+                button.textContent = originalText;
+            }
+        }
+    }
+
+    async function cleanGatewaySession(state, options = {}) {
+        const { elements } = state;
+        const button = options.button || (elements ? elements.clean : null);
+        const feedbackElement = options.feedbackElement || (elements ? elements.feedback : null);
+        if (!state || (!button && !feedbackElement)) {
+            return;
+        }
+        if (!confirm('Parar, limpar sessão e gerar novo QR?')) {
+            return;
+        }
+        const originalText = button ? button.textContent : '';
+        if (button) {
+            button.disabled = true;
+            button.classList.add('is-busy');
+            button.setAttribute('aria-busy', 'true');
+            button.textContent = 'Limpando sessão...';
+        }
+        if (feedbackElement) {
+            feedbackElement.textContent = 'Parando e limpando sessão...';
+        }
+        try {
+            if (state.isOnline) {
+                await postGatewayAction(state, gatewayEndpoints.stop);
+            }
+            await postGatewayAction(state, gatewayEndpoints.reset);
+            if (feedbackElement) {
+                feedbackElement.textContent = 'Sessão limpa. Aguarde o novo QR.';
+            }
+            showGatewayQr(state, false);
+            refreshGatewayStatus(state);
+        } catch (error) {
+            if (feedbackElement) {
+                feedbackElement.textContent = error.message || 'Falha ao limpar sessão';
+            }
+        } finally {
+            if (button) {
+                button.disabled = false;
+                button.classList.remove('is-busy');
+                button.removeAttribute('aria-busy');
+                if (originalText) {
+                    button.textContent = originalText;
+                }
+            }
         }
     }
 
@@ -4720,6 +5285,15 @@
         }, 20000);
     }
 
+    function setGatewayQrPlaceholder(state, text) {
+        if (!state || !state.elements || !state.elements.qrPlaceholder) {
+            return;
+        }
+        const content = text != null ? text : state.qrPlaceholderDefault || '';
+        state.elements.qrPlaceholder.textContent = content;
+        state.elements.qrPlaceholder.hidden = content === '';
+    }
+
     function hideGatewayQr(state, silent = false) {
         const { elements } = state;
         if (!elements.qrPanel) {
@@ -4728,6 +5302,9 @@
         elements.qrPanel.hidden = true;
         state.qrVisible = false;
         state.lastQrData = '';
+        state.qrResetAttempted = false;
+        state.qrAutoResetCount = 0;
+        state.lastResetAt = 0;
         if (elements.qrOpen) {
             elements.qrOpen.disabled = true;
         }
@@ -4735,6 +5312,7 @@
         if (elements.qrButton) {
             elements.qrButton.textContent = 'Mostrar QR';
         }
+        setGatewayQrPlaceholder(state, state.qrPlaceholderDefault || '');
         if (!silent && elements.qrImage) {
             elements.qrImage.removeAttribute('src');
             elements.qrImage.alt = 'QR indisponivel';
@@ -4752,6 +5330,10 @@
         if (!state.qrVisible) {
             return;
         }
+        state.qrPanel.hidden = false;
+        if (!isAuto) {
+            setGatewayQrPlaceholder(state, 'Carregando QR...');
+        }
         if (!isAuto) {
             elements.qrImage.alt = 'Carregando QR...';
         }
@@ -4766,10 +5348,13 @@
             if (response.status === 204) {
                 elements.qrImage.removeAttribute('src');
                 elements.qrImage.alt = 'Sessao conectada (QR nao necessario)';
+                elements.qrPanel.hidden = false;
                 if (elements.qrMeta) {
                     elements.qrMeta.textContent = '';
                 }
+                setGatewayQrPlaceholder(state, 'Sessão conectada. QR não é necessário.');
                 state.lastQrData = '';
+                state.qrAutoResetCount = 0;
                 if (elements.qrOpen) {
                     elements.qrOpen.disabled = true;
                 }
@@ -4778,7 +5363,8 @@
             }
             const data = await response.json().catch(() => ({}));
             if (!response.ok) {
-                throw new Error(data.error || 'QR nao disponivel');
+                const message = (data && data.error) ? String(data.error) : 'QR nao disponivel';
+                throw new Error(message);
             }
             if (data.qr) {
                 elements.qrPanel.hidden = false;
@@ -4801,6 +5387,9 @@
                     }
                     elements.qrMeta.textContent = parts.join(' | ');
                 }
+                state.qrResetAttempted = false;
+                state.qrAutoResetCount = 0;
+                setGatewayQrPlaceholder(state, '');
             } else {
                 elements.qrImage.removeAttribute('src');
                 elements.qrImage.alt = 'Sem QR no momento (sessao conectada)';
@@ -4813,17 +5402,95 @@
                         ? 'Ultimo QR ' + formatRelativeTime(data.generated_at)
                         : '';
                 }
+                setGatewayQrPlaceholder(state, 'Sem QR disponível. Aguarde a reconexão.');
+
+                // Recuperação automática se ficarmos sem QR por muito tempo
+                const now = Date.now();
+                const msSinceReset = state.lastResetAt ? (now - state.lastResetAt) : Infinity;
+                if (isAuto && state.qrAutoResetCount < 2 && msSinceReset > 120000) {
+                    state.qrAutoResetCount += 1;
+                    state.lastResetAt = now;
+                    if (elements.qrMeta) {
+                        elements.qrMeta.textContent = 'Reiniciando sessão automaticamente para tentar novo QR...';
+                    }
+                    try {
+                        await postGatewayAction(state, gatewayEndpoints.reset);
+                        setTimeout(() => {
+                            fetchGatewayQr(state, false);
+                        }, 1500);
+                        return;
+                    } catch (resetError) {
+                        if (elements.qrMeta) {
+                            elements.qrMeta.textContent = resetError.message || 'Falha ao reiniciar sessão para QR.';
+                        }
+                    }
+                }
+
+                // Tentativa automática: se não há QR e ainda não resetamos, force reset para obter um QR fresco
+                if (!isAuto && !state.qrResetAttempted) {
+                    state.qrResetAttempted = true;
+                    state.lastResetAt = Date.now();
+                    try {
+                        elements.qrMeta.textContent = 'Reiniciando sessão para gerar novo QR...';
+                        await postGatewayAction(state, gatewayEndpoints.reset);
+                        setTimeout(() => {
+                            fetchGatewayQr(state, false);
+                        }, 1500);
+                        return;
+                    } catch (resetError) {
+                        elements.qrMeta.textContent = resetError.message || 'Falha ao reiniciar sessão para QR.';
+                    }
+                }
             }
         } catch (error) {
-            if (!isAuto) {
-                elements.qrImage.removeAttribute('src');
-                elements.qrImage.alt = error.message || 'Erro ao buscar QR';
-                state.lastQrData = '';
-                if (elements.qrOpen) {
-                    elements.qrOpen.disabled = true;
-                }
+            elements.qrPanel.hidden = false;
+            elements.qrImage.removeAttribute('src');
+            elements.qrImage.alt = error.message || 'Erro ao buscar QR';
+            state.lastQrData = '';
+            if (elements.qrOpen) {
+                elements.qrOpen.disabled = true;
+            }
+            if (elements.qrMeta) {
+                elements.qrMeta.textContent = error.message || 'QR indisponivel (gateway offline ou sem resposta)';
+            }
+            setGatewayQrPlaceholder(state, error.message || 'QR indisponível no momento.');
+
+            const now = Date.now();
+            const msSinceReset = state.lastResetAt ? (now - state.lastResetAt) : Infinity;
+            if (isAuto && state.qrAutoResetCount < 2 && msSinceReset > 120000) {
+                state.qrAutoResetCount += 1;
+                state.lastResetAt = now;
                 if (elements.qrMeta) {
-                    elements.qrMeta.textContent = '';
+                    elements.qrMeta.textContent = 'Reiniciando sessão automaticamente para tentar novo QR...';
+                }
+                try {
+                    await postGatewayAction(state, gatewayEndpoints.reset);
+                    setTimeout(() => {
+                        fetchGatewayQr(state, false);
+                    }, 1500);
+                    return;
+                } catch (resetError) {
+                    if (elements.qrMeta) {
+                        elements.qrMeta.textContent = resetError.message || 'Falha ao reiniciar sessão para QR.';
+                    }
+                }
+            }
+
+            // Se deu erro e ainda não tentamos reset, tenta uma vez reiniciar para obter QR.
+            if (!isAuto && !state.qrResetAttempted) {
+                state.qrResetAttempted = true;
+                state.lastResetAt = Date.now();
+                try {
+                    elements.qrMeta.textContent = 'Reiniciando sessão para gerar novo QR...';
+                    await postGatewayAction(state, gatewayEndpoints.reset);
+                    setTimeout(() => {
+                        fetchGatewayQr(state, false);
+                    }, 1500);
+                    return;
+                } catch (resetError) {
+                    if (elements.qrMeta) {
+                        elements.qrMeta.textContent = resetError.message || 'Falha ao reiniciar sessão para QR.';
+                    }
                 }
             }
         }
@@ -4932,6 +5599,7 @@
             }
             gatewayCards.forEach((state) => hideGatewayQr(state, true));
         }
+        renderGatewayOfflineToast();
     }
 
     function initializeGatewayCards() {
@@ -4946,26 +5614,9 @@
             if (elements.qrOpen) {
                 elements.qrOpen.addEventListener('click', () => openGatewayQrPopup(state));
             }
-            if (elements.reset) {
-                elements.reset.addEventListener('click', async () => {
-                    if (!confirm('Forcar uma nova autenticacao? Isso encerrara a sessao atual.')) {
-                        return;
-                    }
-                    if (elements.feedback) {
-                        elements.feedback.textContent = 'Reiniciando sessao...';
-                    }
-                    try {
-                        await postGatewayAction(state, gatewayEndpoints.reset);
-                        if (elements.feedback) {
-                            elements.feedback.textContent = 'Sessao reiniciada. Aguarde o novo QR.';
-                        }
-                        refreshGatewayStatus(state);
-                        showGatewayQr(state, false);
-                    } catch (error) {
-                        if (elements.feedback) {
-                            elements.feedback.textContent = error.message || 'Falha ao reiniciar sessao';
-                        }
-                    }
+            if (elements.clean) {
+                elements.clean.addEventListener('click', async () => {
+                    await cleanGatewaySession(state, { feedbackElement: elements.feedback, button: elements.clean });
                 });
             }
             if (elements.start) {
@@ -5035,10 +5686,11 @@
 
     function refreshAllGateways() {
         gatewayCards.forEach((state) => refreshGatewayStatus(state));
+        renderGatewayOfflineToast();
     }
 
-    function refreshLineGateways() {
-        if (!gatewayPanelVisible) {
+    function refreshLineGateways(force = false) {
+        if (!force && !gatewayPanelVisible) {
             return;
         }
         lineGatewayStates.forEach((state) => refreshGatewayStatus(state));
@@ -5048,8 +5700,59 @@
         lineGatewayStates.forEach((state) => {
             const { elements } = state;
             if (elements.start) {
-                elements.start.addEventListener('click', () => {
-                    toggleGatewayProcess(state, { statusElement: elements.status });
+                elements.start.addEventListener('click', async () => {
+                    const button = elements.start;
+                    const original = button.textContent;
+                    button.disabled = true;
+                    button.classList.add('is-busy');
+                    button.textContent = 'Iniciando gateway...';
+                    if (elements.status) {
+                        elements.status.textContent = 'Iniciando gateway...';
+                    }
+                    try {
+                        await postGatewayAction(state, gatewayEndpoints.start);
+                        setTimeout(() => refreshGatewayStatus(state), 1200);
+                    } catch (error) {
+                        if (elements.status) {
+                            elements.status.textContent = error.message || 'Falha ao iniciar gateway';
+                        }
+                    } finally {
+                        button.disabled = false;
+                        button.classList.remove('is-busy');
+                        button.textContent = original || 'Iniciar gateway';
+                    }
+                });
+            }
+            if (elements.stop) {
+                elements.stop.addEventListener('click', async () => {
+                    const button = elements.stop;
+                    const original = button.textContent;
+                    button.disabled = true;
+                    button.classList.add('is-busy');
+                    button.textContent = 'Parando gateway...';
+                    if (elements.status) {
+                        elements.status.textContent = 'Parando gateway...';
+                    }
+                    try {
+                        const data = await postGatewayAction(state, gatewayEndpoints.stop);
+                        const message = (data && data.message)
+                            ? data.message
+                            : 'Comando enviado. Aguarde alguns segundos e atualize.';
+                        if (elements.status) {
+                            elements.status.textContent = message;
+                        }
+                        alert(message);
+                        setTimeout(() => refreshGatewayStatus(state), 3000);
+                    } catch (error) {
+                        if (elements.status) {
+                            elements.status.textContent = error.message || 'Falha ao encerrar gateway';
+                        }
+                        alert(error.message || 'Falha ao encerrar gateway');
+                    } finally {
+                        button.disabled = false;
+                        button.classList.remove('is-busy');
+                        button.textContent = original || 'Parar gateway';
+                    }
                 });
             }
             if (elements.qrButton) {
@@ -5142,13 +5845,8 @@
             }
         });
         if (lineGatewayStates.length > 0) {
-            if (gatewayPanelVisible) {
-                refreshLineGateways();
-            }
+            refreshLineGateways(true);
             setInterval(() => {
-                if (!gatewayPanelVisible) {
-                    return;
-                }
                 refreshLineGateways();
             }, 30000);
         }
@@ -5864,16 +6562,34 @@
         threadSearchInput.addEventListener('input', () => {
             applyThreadSearchFilter();
         });
+        threadSearchInput.addEventListener('keydown', (event) => {
+            if (event.key === 'Enter') {
+                event.preventDefault();
+                applyThreadSearchFilter();
+                scheduleThreadSearchRefresh(80);
+            }
+        });
         applyThreadSearchFilter();
+    }
+    if (threadSearchApply) {
+        threadSearchApply.addEventListener('click', (event) => {
+            event.preventDefault();
+            applyThreadSearchFilter();
+            scheduleThreadSearchRefresh(80);
+        });
     }
     if (threadSearchClear) {
         threadSearchClear.addEventListener('click', () => {
             if (!threadSearchInput) {
                 return;
             }
+            const hadQuery = threadSearchInput.value !== '';
             threadSearchInput.value = '';
             threadSearchInput.focus();
             applyThreadSearchFilter();
+            if (hadQuery) {
+                scheduleThreadSearchRefresh(80);
+            }
         });
     }
 

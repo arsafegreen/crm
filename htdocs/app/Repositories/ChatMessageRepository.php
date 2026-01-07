@@ -27,9 +27,13 @@ final class ChatMessageRepository
         $payload['thread_id'] = (int)($payload['thread_id'] ?? 0);
         $payload['author_id'] = (int)($payload['author_id'] ?? 0);
         $payload['body'] = (string)($payload['body'] ?? '');
+        $payload['type'] = (string)($payload['type'] ?? 'text');
         $payload['external_author'] = $payload['external_author'] ?? null;
         $payload['attachment_path'] = $payload['attachment_path'] ?? null;
         $payload['attachment_name'] = $payload['attachment_name'] ?? null;
+        $payload['attachment_mime'] = $payload['attachment_mime'] ?? null;
+        $payload['attachment_size'] = $payload['attachment_size'] ?? null;
+        $payload['attachment_meta'] = $payload['attachment_meta'] ?? null;
         $payload['is_system'] = !empty($payload['is_system']) ? 1 : 0;
         $payload['created_at'] = $payload['created_at'] ?? $timestamp;
         $payload['updated_at'] = $payload['updated_at'] ?? $timestamp;
@@ -39,9 +43,13 @@ final class ChatMessageRepository
                 thread_id,
                 author_id,
                 body,
+                type,
                 external_author,
                 attachment_path,
                 attachment_name,
+                attachment_mime,
+                attachment_size,
+                attachment_meta,
                 is_system,
                 created_at,
                 updated_at,
@@ -50,9 +58,13 @@ final class ChatMessageRepository
                 :thread_id,
                 :author_id,
                 :body,
+                :type,
                 :external_author,
                 :attachment_path,
                 :attachment_name,
+                :attachment_mime,
+                :attachment_size,
+                :attachment_meta,
                 :is_system,
                 :created_at,
                 :updated_at,
@@ -64,9 +76,13 @@ final class ChatMessageRepository
             ':thread_id' => $payload['thread_id'],
             ':author_id' => $payload['author_id'],
             ':body' => $payload['body'],
+            ':type' => $payload['type'],
             ':external_author' => $payload['external_author'],
             ':attachment_path' => $payload['attachment_path'],
             ':attachment_name' => $payload['attachment_name'],
+            ':attachment_mime' => $payload['attachment_mime'],
+            ':attachment_size' => $payload['attachment_size'],
+            ':attachment_meta' => $payload['attachment_meta'],
             ':is_system' => $payload['is_system'],
             ':created_at' => $payload['created_at'],
             ':updated_at' => $payload['updated_at'],
@@ -271,19 +287,23 @@ final class ChatMessageRepository
         $this->schemaChecked = true;
 
         $this->pdo->exec(
-            'CREATE TABLE IF NOT EXISTS chat_messages (
+            "CREATE TABLE IF NOT EXISTS chat_messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 thread_id INTEGER NOT NULL,
                 author_id INTEGER NOT NULL,
                 body TEXT NOT NULL,
+                type TEXT NOT NULL DEFAULT 'text',
                 external_author TEXT NULL,
                 attachment_path TEXT NULL,
                 attachment_name TEXT NULL,
+                attachment_mime TEXT NULL,
+                attachment_size INTEGER NULL,
+                attachment_meta TEXT NULL,
                 is_system INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
                 deleted_at INTEGER NULL
-            )'
+            )"
         );
 
         $this->pdo->exec('CREATE INDEX IF NOT EXISTS idx_chat_messages_thread ON chat_messages(thread_id)');
@@ -304,6 +324,10 @@ final class ChatMessageRepository
         $this->pdo->exec('CREATE INDEX IF NOT EXISTS idx_chat_message_purges_admin ON chat_message_purges(admin_id)');
         $this->pdo->exec('CREATE INDEX IF NOT EXISTS idx_chat_message_purges_cutoff ON chat_message_purges(cutoff_timestamp)');
         $this->ensureColumnExists('chat_messages', 'external_author', 'TEXT NULL');
+        $this->ensureColumnExists('chat_messages', 'type', "TEXT NOT NULL DEFAULT 'text'");
+        $this->ensureColumnExists('chat_messages', 'attachment_mime', 'TEXT NULL');
+        $this->ensureColumnExists('chat_messages', 'attachment_size', 'INTEGER NULL');
+        $this->ensureColumnExists('chat_messages', 'attachment_meta', 'TEXT NULL');
     }
 
     /**
@@ -316,7 +340,13 @@ final class ChatMessageRepository
         $row['thread_id'] = (int)($row['thread_id'] ?? 0);
         $row['author_id'] = (int)($row['author_id'] ?? 0);
         $row['body'] = (string)($row['body'] ?? '');
+        $row['type'] = isset($row['type']) ? (string)$row['type'] : 'text';
         $row['external_author'] = isset($row['external_author']) ? (string)$row['external_author'] : null;
+        $row['attachment_path'] = isset($row['attachment_path']) ? (string)$row['attachment_path'] : null;
+        $row['attachment_name'] = isset($row['attachment_name']) ? (string)$row['attachment_name'] : null;
+        $row['attachment_mime'] = isset($row['attachment_mime']) ? (string)$row['attachment_mime'] : null;
+        $row['attachment_size'] = isset($row['attachment_size']) ? (int)$row['attachment_size'] : null;
+        $row['attachment_meta'] = isset($row['attachment_meta']) ? $this->decodeMeta($row['attachment_meta']) : null;
         $row['is_system'] = !empty($row['is_system']);
         $row['created_at'] = (int)($row['created_at'] ?? 0);
         $row['updated_at'] = (int)($row['updated_at'] ?? 0);
@@ -325,6 +355,12 @@ final class ChatMessageRepository
         $row['author_email'] = isset($row['author_email']) ? (string)$row['author_email'] : null;
 
         return $row;
+    }
+
+    private function decodeMeta(string $payload): ?array
+    {
+        $decoded = json_decode($payload, true);
+        return is_array($decoded) ? $decoded : null;
     }
 
     private function ensureColumnExists(string $table, string $column, string $definition): void

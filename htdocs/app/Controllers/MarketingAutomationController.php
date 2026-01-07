@@ -11,6 +11,7 @@ use App\Repositories\Email\EmailCampaignBatchRepository;
 use App\Repositories\Email\EmailCampaignRepository;
 use App\Repositories\Email\EmailSendRepository;
 use App\Repositories\Email\EmailJobRepository;
+use App\Repositories\Email\EmailAccountRateLimitRepository;
 use App\Repositories\ClientRepository;
 use App\Repositories\Marketing\AudienceListRepository;
 use App\Repositories\Marketing\MarketingContactRepository;
@@ -41,6 +42,7 @@ final class MarketingAutomationController
     private EmailCampaignBatchRepository $emailBatches;
     private EmailSendRepository $emailSends;
     private MarketingContactRepository $contacts;
+    private EmailAccountRateLimitRepository $rateLimits;
 
     public function __construct(?WhatsappAutomationService $automation = null)
     {
@@ -54,6 +56,7 @@ final class MarketingAutomationController
         $this->emailBatches = new EmailCampaignBatchRepository();
         $this->emailSends = new EmailSendRepository();
         $this->contacts = new MarketingContactRepository();
+        $this->rateLimits = new EmailAccountRateLimitRepository();
     }
 
     public function birthdayStatus(Request $request, array $vars = []): JsonResponse
@@ -80,6 +83,92 @@ final class MarketingAutomationController
         $status['server_time'] = now();
 
         return new JsonResponse($status);
+    }
+
+    public function emailStatus(Request $request, array $vars = []): JsonResponse
+    {
+        $user = $this->currentUser($request);
+        if (!$this->canControl($user)) {
+            return new JsonResponse(['error' => 'Acesso não autorizado.'], 403);
+        }
+
+        $accountId = (int)$request->query->get('account_id', 0);
+        $account = $this->emailAccounts->findActiveSender($accountId > 0 ? $accountId : null);
+        if ($account === null) {
+            return new JsonResponse(['error' => 'Conta de envio nÆo encontrada ou inativa.'], 422);
+        }
+
+        $limits = [
+            'burst' => (int)($account['burst_limit'] ?? 0),
+            'hourly' => (int)($account['hourly_limit'] ?? 0),
+            'daily' => (int)($account['daily_limit'] ?? 0),
+        ];
+
+        $rate = $this->rateLimits->find((int)$account['id']) ?? [
+            'hourly_sent' => 0,
+            'daily_sent' => 0,
+            'window_start' => time(),
+            'last_reset_at' => time(),
+        ];
+        $now = time();
+        $nextHourReset = ((int)($rate['window_start'] ?? $now)) + 3600;
+        $nextDayReset = ((int)($rate['last_reset_at'] ?? $now)) + 86400;
+        $availableBudget = $this->computeAvailableBudget($limits, $rate);
+
+        $campaigns = array_filter(
+            $this->emailCampaigns->list(),
+            static fn(array $c): bool => (int)($c['from_account_id'] ?? 0) === (int)$account['id']
+        );
+        $campaigns = array_slice($campaigns, 0, 5);
+
+        $campaignSummaries = [];
+        foreach ($campaigns as $campaign) {
+            $campaignId = (int)$campaign['id'];
+            $batches = $this->emailBatches->listByCampaign($campaignId);
+            $batchSummaries = [];
+            $totalRemaining = 0;
+
+            foreach ($batches as $batch) {
+                $batchId = (int)$batch['id'];
+                $remaining = $this->emailSends->countByBatch($batchId, ['statuses' => ['pending', 'retry']]);
+                $totalRemaining += $remaining;
+                $batchSummaries[] = [
+                    'id' => $batchId,
+                    'status' => (string)$batch['status'],
+                    'total' => (int)($batch['total_recipients'] ?? 0),
+                    'processed' => (int)($batch['processed_count'] ?? 0),
+                    'failed' => (int)($batch['failed_count'] ?? 0),
+                    'remaining' => $remaining,
+                    'awaiting_window' => $remaining > 0 && $availableBudget === 0,
+                ];
+            }
+
+            $campaignSummaries[] = [
+                'id' => $campaignId,
+                'subject' => $campaign['subject'] ?? '(sem assunto)',
+                'status' => (string)($campaign['status'] ?? 'draft'),
+                'created_at' => (int)($campaign['created_at'] ?? 0),
+                'scheduled_for' => isset($campaign['scheduled_for']) ? (int)$campaign['scheduled_for'] : null,
+                'batches' => $batchSummaries,
+                'remaining' => $totalRemaining,
+            ];
+        }
+
+        return new JsonResponse([
+            'account' => [
+                'id' => (int)$account['id'],
+                'name' => $account['name'] ?? ($account['from_email'] ?? 'Conta'),
+                'limits' => $limits,
+                'usage' => [
+                    'hourly_sent' => (int)($rate['hourly_sent'] ?? 0),
+                    'daily_sent' => (int)($rate['daily_sent'] ?? 0),
+                    'next_hour_reset' => $nextHourReset,
+                    'next_day_reset' => $nextDayReset,
+                ],
+                'available_budget' => $availableBudget,
+            ],
+            'campaigns' => $campaignSummaries,
+        ]);
     }
 
     public function blockingStatus(Request $request, array $vars = []): JsonResponse
@@ -333,7 +422,7 @@ final class MarketingAutomationController
     public function emailOptions(Request $request, array $vars = []): JsonResponse
     {
         $user = $this->currentUser($request);
-        if (!$this->canControlEmail($user) && !$this->hasAutomationToken($request)) {
+        if ($user === null && !$this->hasAutomationToken($request)) {
             return new JsonResponse(['error' => 'Acesso não autorizado.'], 403);
         }
 
@@ -369,6 +458,10 @@ final class MarketingAutomationController
                 'from_name' => $row['from_name'] ?? null,
                 'hourly_limit' => isset($row['hourly_limit']) ? (int)$row['hourly_limit'] : null,
             ];
+        }
+
+        if ($accounts === []) {
+            return new JsonResponse(['error' => 'Nenhuma conta de envio ativa disponível.'], 200);
         }
 
         $listSummary = null;
@@ -432,7 +525,7 @@ final class MarketingAutomationController
     public function scheduleEmail(Request $request, array $vars = []): JsonResponse
     {
         $user = $this->currentUser($request);
-        if (!$this->canControlEmail($user) && !$this->hasAutomationToken($request)) {
+        if ($user === null && !$this->hasAutomationToken($request)) {
             return new JsonResponse(['error' => 'Acesso não autorizado.'], 403);
         }
 
@@ -741,6 +834,36 @@ final class MarketingAutomationController
         return $recipients;
     }
 
+    /**
+     * @param array{burst:int,hourly:int,daily:int} $limits
+     * @param array<string,mixed> $rate
+     */
+    private function computeAvailableBudget(array $limits, array $rate): int
+    {
+        $remaining = PHP_INT_MAX;
+        $burst = max(0, (int)$limits['burst']);
+        $hourly = max(0, (int)$limits['hourly']);
+        $daily = max(0, (int)$limits['daily']);
+        $hourlySent = (int)($rate['hourly_sent'] ?? 0);
+        $dailySent = (int)($rate['daily_sent'] ?? 0);
+
+        if ($burst > 0) {
+            $remaining = min($remaining, $burst);
+        }
+        if ($hourly > 0) {
+            $remaining = min($remaining, max(0, $hourly - $hourlySent));
+        }
+        if ($daily > 0) {
+            $remaining = min($remaining, max(0, $daily - $dailySent));
+        }
+
+        if ($remaining === PHP_INT_MAX) {
+            return 1000000; // trata como sem limite efetivo
+        }
+
+        return max(0, $remaining);
+    }
+
     private function currentUser(Request $request): ?AuthenticatedUser
     {
         $user = $request->attributes->get('user');
@@ -924,3 +1047,5 @@ final class MarketingAutomationController
         return $recipients;
     }
 }
+
+

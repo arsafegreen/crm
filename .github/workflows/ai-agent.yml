@@ -19,9 +19,17 @@ on:
         description: Optional extra question/instruction for the agent
         required: false
         default: ''
+      apply_changes:
+        description: "If true, apply AI diff and open PR (dispatch or /ai-apply)"
+        required: false
+        default: 'false'
+      target_branch:
+        description: "Base branch for PR when applying changes"
+        required: false
+        default: main
 
 permissions:
-  contents: read
+  contents: write
   pull-requests: write
 
 jobs:
@@ -32,6 +40,8 @@ jobs:
       PROVIDER: ${{ github.event.inputs.provider || 'openai' }}
       MODEL: ${{ github.event.inputs.model || 'GPT-5.1-Codex-Max' }}
       PROMPT: ${{ github.event.inputs.prompt || '' }}
+      APPLY_CHANGES: ${{ github.event.inputs.apply_changes || 'false' }}
+      TARGET_BRANCH: ${{ github.event.inputs.target_branch || 'main' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -46,41 +56,45 @@ jobs:
           MODEL: ${{ env.MODEL }}
           PROVIDER: ${{ env.PROVIDER }}
           PROMPT: ${{ env.PROMPT }}
+          APPLY_CHANGES: ${{ env.APPLY_CHANGES }}
+          TARGET_BRANCH: ${{ env.TARGET_BRANCH }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           script: |
             const { execSync } = require('child_process');
+            const fs = require('fs');
             const crypto = require('crypto');
 
             async function run() {
               const provider = (process.env.PROVIDER || 'openai').toLowerCase();
               const model = process.env.MODEL || 'GPT-5.1-Codex-Max';
+              const applyChanges = (process.env.APPLY_CHANGES || 'false').toLowerCase() === 'true';
+              const targetBranch = process.env.TARGET_BRANCH || 'main';
 
               const isPR = context.eventName === 'pull_request';
               const isIssueComment = context.eventName === 'issue_comment';
-              const isPRComment = isIssueComment && !!context.payload.issue?.pull_request;
               const isManual = context.eventName === 'workflow_dispatch';
 
-              // Only respond to /ai comments on PRs for issue_comment events
+              // Respond to /ai or /ai-apply comments on PRs or issues
               let commentPrompt = '';
+              let applyFromComment = false;
               if (isIssueComment) {
-                if (!isPRComment) {
-                  core.info('Comment is not on a pull request. Skipping.');
-                  return;
-                }
                 const body = context.payload.comment?.body || '';
-                const match = body.match(/^\/ai\s*(.*)$/is);
+                const match = body.match(/^\/ai(-apply)?\s*(.*)$/is);
                 if (!match) {
                   core.info('No /ai command found. Skipping.');
                   return;
                 }
-                commentPrompt = match[1].trim();
+                applyFromComment = !!match[1];
+                commentPrompt = (match[2] || '').trim();
                 if (!commentPrompt) {
-                  core.setFailed('No prompt provided after /ai');
+                  core.setFailed('No prompt provided after /ai or /ai-apply');
                   return;
                 }
               }
 
-              const prNumber = isPR ? context.payload.pull_request.number : (isPRComment ? context.payload.issue.number : null);
+              const prNumber = isPR ? context.payload.pull_request.number : null;
+              const issueNumber = isIssueComment ? context.payload.issue?.number : null;
               let baseSha = 'HEAD^';
               let headSha = context.sha;
 
@@ -100,13 +114,13 @@ jobs:
                 } catch (error) {
                   core.warning(`Fetch failed: ${error.message}`);
                 }
-              } else if (isManual) {
-                // Manual run without PR: use HEAD^...HEAD
+              } else if (isManual || isIssueComment) {
+                // Manual run or issue comment without PR: use HEAD^...HEAD
                 try {
                   baseSha = execSync('git rev-parse HEAD^', { encoding: 'utf8' }).trim();
                   headSha = execSync('git rev-parse HEAD', { encoding: 'utf8' }).trim();
                 } catch (error) {
-                  core.warning(`Unable to resolve base/head for manual run: ${error.message}`);
+                  core.warning(`Unable to resolve base/head for manual/issue run: ${error.message}`);
                 }
               }
 
@@ -124,11 +138,11 @@ jobs:
 
               if (!diff.trim() && !extraPrompt.trim()) {
                 const message = 'No changes detected for analysis and no prompt provided.';
-                if (prNumber) {
+                if (prNumber || issueNumber) {
                   await github.rest.issues.createComment({
                     owner: context.repo.owner,
                     repo: context.repo.repo,
-                    issue_number: prNumber,
+                    issue_number: prNumber || issueNumber,
                     body: message,
                   });
                 } else {
@@ -137,13 +151,16 @@ jobs:
                 return;
               }
 
+              const applyHint = (applyChanges || applyFromComment)
+                ? '\nReturn a minimal unified diff patch inside ```diff``` fences (diff --git ...). Only include the patch, no extra prose unless blocked.'
+                : '';
+
               const systemPrompt = 'You are an AI code agent for the CRM (PHP/Laravel + frontend). Provide concise, actionable suggestions to create/correct/improve code. Prefer specific steps and concrete code snippets. Highlight risks and missing tests. Keep output under 450 words.';
-              const userPrompt = `Repository: ${context.repo.owner}/${context.repo.repo}\nEvent: ${context.eventName}\nBase: ${baseSha}\nHead: ${headSha}\nGoals: create new code, fix issues, and suggest improvements for the CRM.${extraPrompt ? `\nUser prompt: ${extraPrompt}` : ''}\nDiff (git diff base...head):\n${diff}`;
+              const userPrompt = `Repository: ${context.repo.owner}/${context.repo.repo}\nEvent: ${context.eventName}\nBase: ${baseSha}\nHead: ${headSha}\nGoals: create new code, fix issues, and suggest improvements for the CRM.${extraPrompt ? `\nUser prompt: ${extraPrompt}` : ''}${applyHint}\nDiff (git diff base...head):\n${diff}`;
 
               async function callOpenAI() {
                 if (!process.env.OPENAI_API_KEY) {
-                  core.setFailed('OPENAI_API_KEY secret not found.');
-                  return null;
+                  return 'OPENAI_API_KEY secret not found in repository secrets.';
                 }
                 const response = await fetch('https://api.openai.com/v1/chat/completions', {
                   method: 'POST',
@@ -174,8 +191,7 @@ jobs:
 
               async function callCopilot() {
                 if (!process.env.COPILOT_TOKEN) {
-                  core.setFailed('COPILOT_TOKEN secret not found. Provide a Copilot API token.');
-                  return null;
+                  return 'COPILOT_TOKEN secret not found in repository secrets.';
                 }
 
                 const requestId = crypto.randomUUID();
@@ -208,8 +224,19 @@ jobs:
               }
 
               let content = null;
+              let finalProvider = provider;
+              let fallbackNote = '';
+
               if (provider === 'copilot') {
-                content = await callCopilot();
+                const copilotResponse = await callCopilot();
+                // If Copilot token is missing or call failed, fall back to OpenAI when available
+                if (!copilotResponse || copilotResponse.startsWith('COPILOT_TOKEN secret not found')) {
+                  finalProvider = 'openai';
+                  fallbackNote = copilotResponse || 'Copilot unavailable; falling back to OpenAI.';
+                  content = await callOpenAI();
+                } else {
+                  content = copilotResponse;
+                }
               } else {
                 content = await callOpenAI();
               }
@@ -218,18 +245,81 @@ jobs:
                 return;
               }
 
-              const body = `🤖 AI Agent (${provider}/${model})\n\n${content}\n\n_Run: ${context.runId}_`;
+              const fallbackLine = fallbackNote ? `\n\nFallback: ${fallbackNote}` : '';
+              const body = `🤖 AI Agent (${finalProvider}/${model})${fallbackLine}\n\n${content}\n\n_Run: ${context.runId}_`;
 
-              if (prNumber) {
-                await github.rest.issues.createComment({
+              // apply_changes honored on manual runs, or when /ai-apply is used in comments
+              const shouldApply = (applyChanges || applyFromComment) && (isManual || isIssueComment || isPR);
+
+              if (!shouldApply) {
+                if (prNumber || issueNumber) {
+                  await github.rest.issues.createComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: prNumber || issueNumber,
+                    body,
+                  });
+                } else {
+                  core.setOutput('analysis', body);
+                  core.info(body);
+                }
+                return;
+              }
+
+              // Parse diff patch from AI output
+              const diffMatch = content.match(/```diff\s*([\s\S]*?)```/i);
+              const patch = diffMatch?.[1]?.trim();
+
+              if (!patch) {
+                core.setFailed('apply_changes requested but no diff patch found in AI output. Ensure the model returns a unified diff inside ```diff``` fences.');
+                return;
+              }
+
+              const patchFile = 'ai-change.patch';
+              fs.writeFileSync(patchFile, patch, 'utf8');
+
+              try {
+                // Ensure base branch is up to date
+                execSync(`git checkout ${targetBranch}`);
+                execSync('git pull --ff-only');
+
+                const branchName = `ai-auto-${context.runId}`;
+                execSync(`git checkout -b ${branchName}`);
+
+                execSync(`git apply --whitespace=fix ${patchFile}`);
+
+                const status = execSync('git status --porcelain', { encoding: 'utf8' }).trim();
+                if (!status) {
+                  core.setFailed('Patch applied but no changes detected.');
+                  return;
+                }
+
+                execSync('git add -A');
+                execSync('git config user.email "github-actions[bot]@users.noreply.github.com"');
+                execSync('git config user.name "github-actions[bot]"');
+                execSync(`git commit -m "AI changes (run ${context.runId})"`);
+
+                const remoteUrl = `https://x-access-token:${process.env.GITHUB_TOKEN}@github.com/${context.repo.owner}/${context.repo.repo}.git`;
+                execSync(`git push ${remoteUrl} ${branchName}`);
+
+                const prTitle = `AI changes (run ${context.runId})`;
+                const prBody = `${body}\n\nApplied automatically from workflow_dispatch with apply_changes=true.`;
+
+                const pr = await github.rest.pulls.create({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
-                  issue_number: prNumber,
-                  body,
+                  title: prTitle,
+                  head: branchName,
+                  base: targetBranch,
+                  body: prBody,
                 });
-              } else {
-                core.setOutput('analysis', body);
-                core.info(body);
+
+                core.info(`PR created: ${pr.data.html_url}`);
+                core.setOutput('pull_request', pr.data.html_url);
+              } catch (error) {
+                core.setFailed(`Failed to apply or push changes: ${error.message}`);
+              } finally {
+                try { fs.unlinkSync(patchFile); } catch (_) {}
               }
             }
 

@@ -27,6 +27,7 @@ use App\Controllers\MarketingController;
 use App\Controllers\MarketingConsentController;
 use App\Controllers\WhatsappController;
 use App\Controllers\WhatsappAltController;
+use App\Controllers\Api\ChatbotController;
 use Symfony\Component\HttpFoundation\RedirectResponse;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Response;
@@ -40,6 +41,7 @@ final class AuthGuard
         MarketingConsentController::class => ['show', 'update', 'downloadLogs'],
         WhatsappController::class => ['webhook', 'verifyWebhook'],
         WhatsappAltController::class => ['webhook'],
+        ChatbotController::class => ['suggest', 'actions'],
     ];
 
     /** @var array<class-string> */
