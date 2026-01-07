@@ -46,10 +46,10 @@ jobs:
           PROMPT: ${{ env.PROMPT }}
         with:
           script: |
-            module.exports = async ({ core, github, context }) => {
-              const { execSync } = require('child_process');
-              const crypto = require('crypto');
+            const { execSync } = require('child_process');
+            const crypto = require('crypto');
 
+            async function run() {
               const provider = (process.env.PROVIDER || 'openai').toLowerCase();
               const model = process.env.MODEL || 'GPT-5.1-Codex-Max';
 
@@ -190,4 +190,6 @@ jobs:
                 core.setOutput('analysis', body);
                 core.info(body);
               }
-            };
+            }
+
+            run();
