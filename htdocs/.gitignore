@@ -6,3 +6,5 @@
 /storage/database.sqlite
 .idea/
 .vscode/
+tmp*.php
+tmp*.py
