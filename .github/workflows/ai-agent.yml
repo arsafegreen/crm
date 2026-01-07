@@ -3,6 +3,8 @@ name: AI Agent Assistant
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+  issue_comment:
+    types: [created]
   workflow_dispatch:
     inputs:
       provider:
@@ -54,20 +56,50 @@ jobs:
               const model = process.env.MODEL || 'GPT-5.1-Codex-Max';
 
               const isPR = context.eventName === 'pull_request';
-              const pr = context.payload.pull_request;
+              const isIssueComment = context.eventName === 'issue_comment';
+              const isPRComment = isIssueComment && !!context.payload.issue?.pull_request;
 
-              let baseSha = 'HEAD^';
-              if (isPR) {
-                baseSha = pr.base.sha;
-              } else {
-                try {
-                  baseSha = execSync('git rev-parse HEAD^', { encoding: 'utf8' }).trim();
-                } catch (error) {
-                  baseSha = execSync('git rev-list --max-parents=0 HEAD', { encoding: 'utf8' }).trim();
+              // Only respond to /ai comments on PRs for issue_comment events
+              let commentPrompt = '';
+              if (isIssueComment) {
+                if (!isPRComment) {
+                  core.info('Comment is not on a pull request. Skipping.');
+                  return;
+                }
+                const body = context.payload.comment?.body || '';
+                const match = body.match(/^\/ai\s*(.*)$/is);
+                if (!match) {
+                  core.info('No /ai command found. Skipping.');
+                  return;
+                }
+                commentPrompt = match[1].trim();
+                if (!commentPrompt) {
+                  core.setFailed('No prompt provided after /ai');
+                  return;
                 }
               }
 
-              const headSha = context.sha;
+              const prNumber = isPR ? context.payload.pull_request.number : (isPRComment ? context.payload.issue.number : null);
+              if (!prNumber) {
+                core.setFailed('PR number not found.');
+                return;
+              }
+
+              const prData = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber,
+              });
+
+              const baseSha = prData.data.base.sha;
+              const headSha = prData.data.head.sha;
+
+              // Ensure commits are present locally for diff
+              try {
+                execSync(`git fetch origin ${baseSha} ${headSha}`, { stdio: 'ignore' });
+              } catch (error) {
+                core.warning(`Fetch failed: ${error.message}`);
+              }
 
               let diff = '';
               try {
@@ -79,20 +111,16 @@ jobs:
                 core.warning(`Unable to compute diff: ${error.message}`);
               }
 
-              const extraPrompt = process.env.PROMPT || '';
+              const extraPrompt = isIssueComment ? commentPrompt : (process.env.PROMPT || '');
 
               if (!diff.trim() && !extraPrompt.trim()) {
                 const message = 'No changes detected for analysis and no prompt provided.';
-                if (isPR) {
-                  await github.rest.issues.createComment({
-                    owner: context.repo.owner,
-                    repo: context.repo.repo,
-                    issue_number: pr.number,
-                    body: message,
-                  });
-                } else {
-                  core.info(message);
-                }
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: prNumber,
+                  body: message,
+                });
                 return;
               }
 
