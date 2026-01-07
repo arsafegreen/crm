@@ -10,9 +10,9 @@ on:
         required: false
         default: openai
       model:
-        description: Model (gpt-4o-mini default)
+        description: Model (default GPT-5.1-Codex-Max)
         required: false
-        default: gpt-4o-mini
+        default: GPT-5.1-Codex-Max
       prompt:
         description: Optional extra question/instruction for the agent
         required: false
@@ -28,7 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       PROVIDER: ${{ github.event.inputs.provider || 'openai' }}
-      MODEL: ${{ github.event.inputs.model || 'gpt-4o-mini' }}
+      MODEL: ${{ github.event.inputs.model || 'GPT-5.1-Codex-Max' }}
       PROMPT: ${{ github.event.inputs.prompt || '' }}
     steps:
       - name: Checkout
@@ -46,13 +46,12 @@ jobs:
           PROMPT: ${{ env.PROMPT }}
         with:
           script: |
-            const core = require('@actions/core');
-            const github = require('@actions/github');
+            // core and github are provided by actions/github-script
             const { execSync } = require('child_process');
             const crypto = require('crypto');
 
             const provider = (process.env.PROVIDER || 'openai').toLowerCase();
-            const model = process.env.MODEL || 'gpt-4o-mini';
+            const model = process.env.MODEL || 'GPT-5.1-Codex-Max';
 
             const isPR = github.context.eventName === 'pull_request';
             const pr = github.context.payload.pull_request;
