@@ -74,6 +74,10 @@ htdocs/.env.*
 htdocs/storage/
 htdocs/tmp/
 htdocs/public/uploads/
+htdocs/tmp*.php
+htdocs/tmp*.py
+htdocs/tmp-*.php
+htdocs/tmp-*.py
 
 # Node / frontend
 node_modules/
