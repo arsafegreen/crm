@@ -58,6 +58,7 @@ jobs:
               const isPR = context.eventName === 'pull_request';
               const isIssueComment = context.eventName === 'issue_comment';
               const isPRComment = isIssueComment && !!context.payload.issue?.pull_request;
+              const isManual = context.eventName === 'workflow_dispatch';
 
               // Only respond to /ai comments on PRs for issue_comment events
               let commentPrompt = '';
@@ -80,25 +81,33 @@ jobs:
               }
 
               const prNumber = isPR ? context.payload.pull_request.number : (isPRComment ? context.payload.issue.number : null);
-              if (!prNumber) {
-                core.setFailed('PR number not found.');
-                return;
-              }
+              let baseSha = 'HEAD^';
+              let headSha = context.sha;
 
-              const prData = await github.rest.pulls.get({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                pull_number: prNumber,
-              });
+              if (prNumber) {
+                const prData = await github.rest.pulls.get({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: prNumber,
+                });
 
-              const baseSha = prData.data.base.sha;
-              const headSha = prData.data.head.sha;
+                baseSha = prData.data.base.sha;
+                headSha = prData.data.head.sha;
 
-              // Ensure commits are present locally for diff
-              try {
-                execSync(`git fetch origin ${baseSha} ${headSha}`, { stdio: 'ignore' });
-              } catch (error) {
-                core.warning(`Fetch failed: ${error.message}`);
+                // Ensure commits are present locally for diff
+                try {
+                  execSync(`git fetch origin ${baseSha} ${headSha}`, { stdio: 'ignore' });
+                } catch (error) {
+                  core.warning(`Fetch failed: ${error.message}`);
+                }
+              } else if (isManual) {
+                // Manual run without PR: use HEAD^...HEAD
+                try {
+                  baseSha = execSync('git rev-parse HEAD^', { encoding: 'utf8' }).trim();
+                  headSha = execSync('git rev-parse HEAD', { encoding: 'utf8' }).trim();
+                } catch (error) {
+                  core.warning(`Unable to resolve base/head for manual run: ${error.message}`);
+                }
               }
 
               let diff = '';
@@ -115,12 +124,16 @@ jobs:
 
               if (!diff.trim() && !extraPrompt.trim()) {
                 const message = 'No changes detected for analysis and no prompt provided.';
-                await github.rest.issues.createComment({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  issue_number: prNumber,
-                  body: message,
-                });
+                if (prNumber) {
+                  await github.rest.issues.createComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: prNumber,
+                    body: message,
+                  });
+                } else {
+                  core.info(message);
+                }
                 return;
               }
 
@@ -207,11 +220,11 @@ jobs:
 
               const body = `🤖 AI Agent (${provider}/${model})\n\n${content}\n\n_Run: ${context.runId}_`;
 
-              if (isPR) {
+              if (prNumber) {
                 await github.rest.issues.createComment({
                   owner: context.repo.owner,
                   repo: context.repo.repo,
-                  issue_number: pr.number,
+                  issue_number: prNumber,
                   body,
                 });
               } else {
