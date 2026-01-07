@@ -8,5 +8,3 @@
 .vscode/
 tmp*.php
 tmp*.py
-tmp-*.php
-tmp-*.py
