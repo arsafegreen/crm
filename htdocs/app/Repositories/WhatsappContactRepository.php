@@ -216,4 +216,18 @@ final class WhatsappContactRepository
 
         return preg_replace('/\D+/', '', $trimmed) ?? $trimmed;
     }
+
+    public function findByName(string $name): ?array
+    {
+        $normalized = trim(mb_strtolower($name));
+        if ($normalized === '') {
+            return null;
+        }
+
+        $stmt = $this->pdo->prepare('SELECT * FROM whatsapp_contacts WHERE LOWER(name) = :name LIMIT 1');
+        $stmt->execute([':name' => $normalized]);
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+
+        return $row !== false ? $row : null;
+    }
 }

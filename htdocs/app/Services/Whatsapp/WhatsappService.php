@@ -1460,6 +1460,30 @@ public function dispatchBroadcast(array $input, AuthenticatedUser $actor): array
         $decorated = $this->decorateThreads([$thread]);
         $thread = $decorated[0];
 
+        $isGroupThread = ($thread['chat_type'] ?? '') === 'group';
+        $groupThreads = [];
+        if ($isGroupThread) {
+            $groupThreads = $this->threads->findGroupThreadsByChannelOrSubject(
+                (string)($thread['channel_thread_id'] ?? ''),
+                (string)($thread['group_subject'] ?? ''),
+                (string)($thread['contact_phone'] ?? '')
+            );
+            if ($groupThreads !== []) {
+                $groupThreads = $this->decorateThreads($groupThreads);
+                $found = false;
+                foreach ($groupThreads as $decoratedThread) {
+                    if ((int)($decoratedThread['id'] ?? 0) === $threadId) {
+                        $thread = $decoratedThread;
+                        $found = true;
+                        break;
+                    }
+                }
+                if (!$found) {
+                    $groupThreads[] = $thread;
+                }
+            }
+        }
+
         $contact = $this->contacts->find((int)$thread['contact_id']);
         if ($contact === null) {
             return null;
@@ -1481,20 +1505,36 @@ public function dispatchBroadcast(array $input, AuthenticatedUser $actor): array
             }
         }
 
-        $messages = $this->messages->listForThread($threadId, self::INITIAL_THREAD_MESSAGE_LIMIT);
-        $messages = array_values(array_map(function (array $row): array {
-            $messageId = (int)($row['id'] ?? 0);
-            $row['metadata'] = $this->sanitizeMessageMetadata($row['metadata'] ?? null, $messageId);
-            return $row;
-        }, $messages));
+        $threadsForMessages = $isGroupThread && $groupThreads !== [] ? $groupThreads : [$thread];
+        $messages = [];
+        foreach ($threadsForMessages as $threadItem) {
+            $targetId = (int)($threadItem['id'] ?? 0);
+            if ($targetId <= 0) {
+                continue;
+            }
+            $threadMessages = $this->messages->listForThread($targetId, 100);
+            $threadMessages = array_values(array_map(function (array $row) use ($targetId): array {
+                $messageId = (int)($row['id'] ?? 0);
+                $row['metadata'] = $this->sanitizeMessageMetadata($row['metadata'] ?? null, $messageId);
+                $row['source_thread_id'] = $targetId;
+                return $row;
+            }, $threadMessages));
+            $messages = array_merge($messages, $threadMessages);
+            $this->threads->markAsRead($targetId);
+        }
+        usort($messages, static function (array $a, array $b): int {
+            $aSent = (int)($a['sent_at'] ?? $a['created_at'] ?? 0);
+            $bSent = (int)($b['sent_at'] ?? $b['created_at'] ?? 0);
+            return $aSent <=> $bSent;
+        });
 
-        $this->threads->markAsRead($threadId);
         $thread['unread_count'] = 0;
 
         return [
             'thread' => $thread,
             'contact' => $contact,
             'messages' => $messages,
+            'group_threads' => $isGroupThread ? $threadsForMessages : [],
         ];
     }
 
@@ -1520,24 +1560,50 @@ public function dispatchBroadcast(array $input, AuthenticatedUser $actor): array
             }
         }
 
+        $isGroupThread = ($thread['chat_type'] ?? '') === 'group';
+        $groupThreads = [];
+        if ($isGroupThread) {
+            $groupThreads = $this->threads->findGroupThreadsByChannelOrSubject(
+                (string)($thread['channel_thread_id'] ?? ''),
+                (string)($thread['group_subject'] ?? ''),
+                (string)($thread['contact_phone'] ?? '')
+            );
+        }
+        $threadsForMessages = $isGroupThread && $groupThreads !== [] ? $groupThreads : [$thread];
+
         $after = max(0, $afterMessageId);
-        $rows = $this->messages->listAfterId($threadId, $after, 100);
         $formatted = [];
         $lastId = $after;
 
-        foreach ($rows as $row) {
-            $message = $this->formatMessageForClient($row);
-            if ($message !== null) {
-                $formatted[] = $message;
+        foreach ($threadsForMessages as $threadItem) {
+            $targetId = (int)($threadItem['id'] ?? 0);
+            if ($targetId <= 0) {
+                continue;
             }
-            $rowId = (int)($row['id'] ?? 0);
-            if ($rowId > $lastId) {
-                $lastId = $rowId;
+            $rows = $this->messages->listAfterId($targetId, $after, 100);
+            foreach ($rows as $row) {
+                $row['source_thread_id'] = $targetId;
+                $message = $this->formatMessageForClient($row);
+                if ($message !== null) {
+                    $formatted[] = $message;
+                }
+                $rowId = (int)($row['id'] ?? 0);
+                if ($rowId > $lastId) {
+                    $lastId = $rowId;
+                }
+            }
+            if ($markAsRead) {
+                $this->threads->markAsRead($targetId);
             }
         }
 
+        usort($formatted, static function (array $a, array $b): int {
+            $aSent = (int)($a['sent_at'] ?? $a['created_at'] ?? 0);
+            $bSent = (int)($b['sent_at'] ?? $b['created_at'] ?? 0);
+            return $aSent <=> $bSent;
+        });
+
         if ($markAsRead) {
-            $this->threads->markAsRead($threadId);
             $thread['unread_count'] = 0;
         }
 
@@ -3226,6 +3292,7 @@ Produza uma única resposta curta, mantendo o tom solicitado e convidando o clie
             }
         }
         $phone = $normalizedPhone;
+        $groupThreadKey = $this->resolveGroupThreadKey($metaExtras, $meta, (string)$phone);
 
         if ($metaMessageId !== '') {
             $existingByMeta = $this->messages->findByMetaMessageId($metaMessageId);
@@ -3242,7 +3309,12 @@ Produza uma única resposta curta, mantendo o tom solicitado e convidando o clie
         }
 
         $chatMetadata = $metaExtras;
-        $isGroupChat = str_starts_with($phone, 'group:') || (($chatMetadata['chat_type'] ?? '') === 'group');
+        $isGroupChat = $groupThreadKey !== null
+            || str_starts_with($phone, 'group:')
+            || (($chatMetadata['chat_type'] ?? '') === 'group');
+        if ($isGroupChat && $groupThreadKey !== null) {
+            $phone = $groupThreadKey;
+        }
         $groupSubject = null;
         $groupMetadata = null;
         if ($isGroupChat) {
@@ -3264,6 +3336,13 @@ Produza uma única resposta curta, mantendo o tom solicitado e convidando o clie
             }
         }
 
+        if ($isGroupChat && $groupThreadKey === null) {
+            $groupThreadKey = $this->normalizeGroupKeyCandidate($phone);
+            if ($groupThreadKey !== null) {
+                $phone = $groupThreadKey;
+            }
+        }
+
         $contactMetadata = [
             'profile' => $meta['contact_name'] ?? null,
             'source' => 'log_import',
@@ -3271,6 +3350,7 @@ Produza uma única resposta curta, mantendo o tom solicitado e convidando o clie
         if ($isGroupChat) {
             $contactMetadata['chat_type'] = 'group';
         }
+        $contactMetadata['normalized_from'] = $phone;
 
         $contact = $this->contacts->findOrCreate($phone, [
             'name' => $meta['contact_name'] ?? ($isGroupChat ? 'Grupo WhatsApp' : ''),
@@ -3302,15 +3382,22 @@ Produza uma única resposta curta, mantendo o tom solicitado e convidando o clie
                 : $this->threads->findLatestByContact((int)$contact['id']);
         }
 
-        if ($thread === null && $gatewayInstance !== null) {
+        if ($thread === null && $gatewayInstance !== null && !$isGroupChat) {
             $channelValue = $this->buildAltChannelId((string)$contact['phone'], $gatewayInstance);
             $thread = $this->threads->findByChannelId($channelValue);
         }
 
         if ($channelValue === '') {
-            $channelValue = $gatewayInstance !== null
-                ? $this->buildAltChannelId((string)$contact['phone'], $gatewayInstance)
-                : 'contact:' . $contact['phone'];
+            if ($isGroupChat) {
+                $baseChannel = $groupThreadKey ?? (string)$contact['phone'];
+                $channelValue = $gatewayInstance !== null
+                    ? 'alt:' . $gatewayInstance . ':' . $baseChannel
+                    : $baseChannel;
+            } else {
+                $channelValue = $gatewayInstance !== null
+                    ? $this->buildAltChannelId((string)$contact['phone'], $gatewayInstance)
+                    : 'contact:' . $contact['phone'];
+            }
         }
 
         if ($thread === null) {
@@ -3602,17 +3689,37 @@ Produza uma única resposta curta, mantendo o tom solicitado e convidando o clie
         $chatType = 'direct';
         $groupSubject = null;
         $groupMetadata = null;
+        $groupThreadKey = null;
 
         $remoteJid = (string)($gatewayMeta['remote_jid'] ?? $gatewayMeta['remoteJid'] ?? $gatewayMeta['chat_id'] ?? $gatewayMeta['chatId'] ?? '');
         $channelThreadIdMeta = (string)($gatewayMeta['channel_thread_id'] ?? '');
         $looksLikeGroupJid = $remoteJid !== '' && (str_contains($remoteJid, '@g.us') || str_contains($remoteJid, '-'));
+        [, $channelPhoneFromMeta] = $this->parseAltChannelId($channelThreadIdMeta);
         $looksLikeGroupChannel = $channelThreadIdMeta !== '' && str_starts_with($channelThreadIdMeta, 'group:');
+        if (!$looksLikeGroupChannel && is_string($channelPhoneFromMeta)) {
+            $looksLikeGroupChannel = str_starts_with($channelPhoneFromMeta, 'group:');
+        }
+        $looksLikeNewsletter = str_contains($remoteJid, '@newsletter')
+            || str_contains($channelThreadIdMeta, '@newsletter')
+            || str_contains((string)($gatewayMeta['chat_type'] ?? ''), 'newsletter')
+            || str_contains((string)($gatewayMeta['chatId'] ?? ''), '@newsletter');
 
-        if (($gatewayMeta['chat_type'] ?? '') === 'group' || str_starts_with($from, 'group:') || $looksLikeGroupJid || $looksLikeGroupChannel) {
+        $hasGroupHints = !empty($gatewayMeta['group_jid'])
+            || !empty($gatewayMeta['group_participant'])
+            || !empty($gatewayMeta['group_subject'])
+            || ($metadata['profile'] ?? '') === 'Grupo WhatsApp';
+
+        if (($gatewayMeta['chat_type'] ?? '') === 'group'
+            || str_starts_with($from, 'group:')
+            || $looksLikeGroupJid
+            || $looksLikeGroupChannel
+            || $looksLikeNewsletter
+            || $hasGroupHints) {
             $chatType = 'group';
             $subjectHint = trim((string)($gatewayMeta['group_subject'] ?? $metadata['profile'] ?? ''));
-            $groupSubject = $subjectHint !== '' ? $subjectHint : 'Grupo WhatsApp';
+            $groupSubject = $subjectHint !== '' ? $subjectHint : ($looksLikeNewsletter ? 'Canal WhatsApp' : 'Grupo WhatsApp');
             $metadata['profile'] = $groupSubject;
+            $groupThreadKey = $this->resolveGroupThreadKey($gatewayMeta, $metadata, $from);
 
             $participantData = $gatewayMeta['group_participant'] ?? [];
             $participantName = $participantData['name'] ?? ($gatewayMeta['participant_name'] ?? null);
@@ -3633,11 +3740,21 @@ Produza uma única resposta curta, mantendo o tom solicitado e convidando o clie
             }
         }
 
+        if ($chatType === 'group' && $groupThreadKey === null) {
+            $groupThreadKey = $this->resolveGroupThreadKey($gatewayMeta, $metadata, $from);
+            if ($groupThreadKey === null) {
+                $groupThreadKey = $this->normalizeGroupKeyCandidate($fromNormalized);
+            }
+        }
+
         $contactMetadata = [
             'profile' => $metadata['profile'] ?? null,
         ];
         if ($chatType === 'group') {
             $contactMetadata['chat_type'] = 'group';
+            if ($normalizedFrom !== '') {
+                $contactMetadata['participant_phone'] = $normalizedFrom;
+            }
         }
 
         $profileName = (string)($metadata['profile'] ?? '');
@@ -3647,13 +3764,17 @@ Produza uma única resposta curta, mantendo o tom solicitado e convidando o clie
         }
         $contactMetadata['profile_photo'] = $profilePhoto;
         $contactMetadata['raw_from'] = $from;
-        $contactMetadata['normalized_from'] = $normalizedFrom;
+        $contactPhone = $chatType === 'group' && $groupThreadKey !== null ? $groupThreadKey : $fromNormalized;
+        if ($contactPhone === '' && $normalizedFrom !== '') {
+            $contactPhone = $normalizedFrom;
+        }
+        $contactMetadata['normalized_from'] = $contactPhone;
 
         $timestamp = $metadata['timestamp'] ?? now();
         $existingSnapshotAt = 0;
         $existingSnapshot = null;
 
-        $contact = $this->contacts->findOrCreate($fromNormalized, [
+        $contact = $this->contacts->findOrCreate($contactPhone, [
             'name' => $profileName,
             'metadata' => json_encode($contactMetadata, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
             'last_interaction_at' => $metadata['timestamp'] ?? now(),
@@ -3677,7 +3798,7 @@ Produza uma única resposta curta, mantendo o tom solicitado e convidando o clie
         $snapshot = $this->buildGatewaySnapshot(
             $metadata,
             $gatewayMeta,
-            $normalizedFrom,
+            $contactPhone,
             $profileName,
             $profilePhoto,
             $timestamp,
@@ -3699,8 +3820,8 @@ Produza uma única resposta curta, mantendo o tom solicitado e convidando o clie
         $updatePayload = [];
 
         // Auto-vincular ao cliente quando houver match por telefone; evita salvar "SafeGreen" como contato do cliente.
-        if (!$contactHasClient) {
-            $linkedClient = $this->findClientByPhone($fromNormalized);
+        if (!$contactHasClient && $chatType !== 'group') {
+            $linkedClient = $this->findClientByPhone($contactPhone);
             if ($linkedClient !== null) {
                 $contactHasClient = true;
                 $updatePayload['client_id'] = (int)$linkedClient['id'];
@@ -3754,9 +3875,24 @@ Produza uma única resposta curta, mantendo o tom solicitado e convidando o clie
             $thread = $this->threads->findLatestByContact((int)$contact['id']);
         }
 
-        $channelValue = $isAltGateway
-            ? $this->buildAltChannelId((string)$contact['phone'], $altInstanceSlug)
-            : 'contact:' . $contact['phone'];
+        if ($chatType === 'group') {
+            $channelValueBase = $groupThreadKey ?? (string)$contact['phone'];
+            $channelValue = $isAltGateway && $altInstanceSlug !== null
+                ? 'alt:' . $altInstanceSlug . ':' . $channelValueBase
+                : $channelValueBase;
+        } else {
+            if ($isAltGateway) {
+                if ($channelThreadIdMeta !== '') {
+                    $channelValue = str_starts_with($channelThreadIdMeta, 'alt:')
+                        ? $channelThreadIdMeta
+                        : 'alt:' . ($altInstanceSlug ?? $this->defaultAltGatewaySlug() ?? 'default') . ':' . $channelThreadIdMeta;
+                } else {
+                    $channelValue = $this->buildAltChannelId((string)$contact['phone'], $altInstanceSlug);
+                }
+            } else {
+                $channelValue = 'contact:' . $contact['phone'];
+            }
+        }
 
         if ($thread === null && $channelValue !== '') {
             $existingThread = $this->threads->findByChannelId($channelValue);
@@ -3796,7 +3932,7 @@ Produza uma única resposta curta, mantendo o tom solicitado e convidando o clie
         // Keep channel id consistent for alt gateway threads; also reuse existing channel ids when possible.
         if ($isAltGateway) {
             $channelId = (string)($thread['channel_thread_id'] ?? '');
-            $needsChannelUpdate = $channelId === '' || $channelId !== $channelValue || !str_starts_with($channelId, 'alt:');
+            $needsChannelUpdate = $channelId === '' || $channelId !== $channelValue || ($chatType !== 'group' && !str_starts_with($channelId, 'alt:'));
             if ($needsChannelUpdate) {
                 try {
                     $this->threads->update((int)$thread['id'], [
@@ -4700,6 +4836,9 @@ Produza uma única resposta curta, mantendo o tom solicitado e convidando o clie
             if (!is_string($value)) {
                 return;
             }
+            if (str_contains($value, '@lid')) {
+                return;
+            }
             $digits = preg_replace('/\D+/', '', $value) ?: '';
             if ($digits === '') {
                 return;
@@ -4730,6 +4869,9 @@ Produza uma única resposta curta, mantendo o tom solicitado e convidando o clie
                 $push((string)$gatewayMeta[$key]);
             }
         }
+        if (isset($gatewayMeta['sender_id_digits'])) {
+            $push((string)$gatewayMeta['sender_id_digits']);
+        }
 
         // Parse alt channel id to recover phone if provided as alt:<slug>:<digits>.
         if (isset($gatewayMeta['channel_thread_id'])) {
@@ -4751,6 +4893,68 @@ Produza uma única resposta curta, mantendo o tom solicitado e convidando o clie
         $fallback = $candidates[0]['digits'] ?? '';
 
         return $fallback !== '' ? $this->normalizeIncomingDigits($fallback) : '';
+    }
+
+    private function resolveGroupThreadKey(array $gatewayMeta, array $metadata, string $rawFrom): ?string
+    {
+        $candidates = [];
+        $push = static function ($value) use (&$candidates): void {
+            if (!is_string($value)) {
+                return;
+            }
+            $trimmed = trim($value);
+            if ($trimmed !== '') {
+                $candidates[] = $trimmed;
+            }
+        };
+
+        $push($gatewayMeta['channel_thread_id'] ?? null);
+        $push($metadata['channel_thread_id'] ?? null);
+        $push($gatewayMeta['group_jid'] ?? ($gatewayMeta['groupJid'] ?? null));
+        $push($gatewayMeta['chat_id'] ?? ($gatewayMeta['chatId'] ?? null));
+        $push($gatewayMeta['remote_jid'] ?? ($gatewayMeta['remoteJid'] ?? null));
+        $push($gatewayMeta['conversation_id'] ?? ($gatewayMeta['conversationId'] ?? null));
+        $push($gatewayMeta['id'] ?? null);
+        $push($rawFrom);
+
+        foreach ($candidates as $candidate) {
+            $normalized = $this->normalizeGroupKeyCandidate($candidate);
+            if ($normalized !== null) {
+                return $normalized;
+            }
+        }
+
+        return null;
+    }
+
+    private function normalizeGroupKeyCandidate(string $candidate): ?string
+    {
+        $value = trim($candidate);
+        if ($value === '') {
+            return null;
+        }
+
+        if (str_starts_with($value, 'alt:')) {
+            [, $channelPhone] = $this->parseAltChannelId($value);
+            if (is_string($channelPhone) && $channelPhone !== '') {
+                $value = $channelPhone;
+            }
+        }
+
+        if (str_starts_with($value, 'group:')) {
+            $value = substr($value, 6);
+        }
+
+        if (str_contains($value, '@')) {
+            $value = substr($value, 0, strpos($value, '@'));
+        }
+
+        $normalized = preg_replace('/[^a-zA-Z0-9]+/', '', $value) ?: '';
+        if ($normalized === '') {
+            return null;
+        }
+
+        return 'group:' . strtolower($normalized);
     }
 
     private function logBlockedInbound(string $phone, string $text, array $metadata): void

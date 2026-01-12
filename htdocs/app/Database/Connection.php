@@ -53,6 +53,11 @@ final class Connection
                     self::ensureDirectory(dirname($path));
                     touch($path);
                 }
+
+                // Clear read-only flag so SQLite can write WAL/locks.
+                if (!is_writable($path)) {
+                    @chmod($path, 0666);
+                }
             }
 
             $dsn = 'sqlite:' . $path;

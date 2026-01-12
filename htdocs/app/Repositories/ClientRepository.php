@@ -8,6 +8,7 @@ use App\Database\Connection;
 use DateTimeImmutable;
 use DateTimeZone;
 use PDO;
+use Throwable;
 use function digits_only;
 
 final class ClientRepository
@@ -126,11 +127,17 @@ final class ClientRepository
             }
 
             if ($extraStmt !== null) {
-                $needle = '%"' . $variant . '"%';
-                $extraStmt->execute([':needle' => $needle]);
-                $row = $extraStmt->fetch(PDO::FETCH_ASSOC);
-                if ($row !== false && $this->extraPhonesContains($row, $variant)) {
-                    return $row;
+                try {
+                    $needle = '%"' . $variant . '"%';
+                    $extraStmt->execute([':needle' => $needle]);
+                    $row = $extraStmt->fetch(PDO::FETCH_ASSOC);
+                    if ($row !== false && $this->extraPhonesContains($row, $variant)) {
+                        return $row;
+                    }
+                } catch (Throwable) {
+                    // Column not available in this database; disable extra phones lookup for this request.
+                    $this->clientsHasExtraPhonesColumn = false;
+                    $extraStmt = null;
                 }
             }
         }

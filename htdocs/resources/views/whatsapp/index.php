@@ -376,6 +376,13 @@ $contactGatewaySource = is_array($contactGatewaySnapshot) ? (string)($contactGat
 $contactGatewayCapturedAt = is_array($contactGatewaySnapshot) && isset($contactGatewaySnapshot['captured_at'])
     ? (int)$contactGatewaySnapshot['captured_at']
     : 0;
+$gatewaySnapshotPhoto = $contactGatewaySnapshot['profile_photo'] ?? null;
+if ($contactProfilePhoto === null && is_string($gatewaySnapshotPhoto) && str_starts_with($gatewaySnapshotPhoto, 'http')) {
+    $contactProfilePhoto = $gatewaySnapshotPhoto;
+}
+$contactCreatedAt = isset($activeContact['created_at']) ? (int)$activeContact['created_at'] : null;
+$contactUpdatedAt = isset($activeContact['updated_at']) ? (int)$activeContact['updated_at'] : null;
+$contactLastInteractionAt = isset($activeContact['last_interaction_at']) ? (int)$activeContact['last_interaction_at'] : null;
 
 
 
@@ -897,7 +904,39 @@ $normalizePhoneKey = static function ($value, $fallbackId = null): string {
 
 
 
-$normalizeGroupKey = static function (array $thread) use ($normalizePhoneKey): string {
+$extractGroupMetadata = static function (array $thread): array {
+    $rawMeta = $thread['group_metadata'] ?? [];
+    if (is_string($rawMeta) && trim($rawMeta) !== '') {
+        $decoded = json_decode($rawMeta, true);
+        if (is_array($decoded)) {
+            $rawMeta = $decoded;
+        }
+    }
+    $meta = is_array($rawMeta) ? $rawMeta : [];
+    $subject = trim((string)($thread['group_subject'] ?? ($meta['subject'] ?? '')));
+    $chatId = trim((string)($meta['chat_id'] ?? ''));
+    $participant = isset($meta['participant']) && is_array($meta['participant']) ? $meta['participant'] : [];
+    $participantName = trim((string)($participant['name'] ?? ''));
+    $participantPhone = trim((string)($participant['phone'] ?? ''));
+
+    return [
+        'chat_id' => $chatId,
+        'subject' => $subject,
+        'participant_name' => $participantName,
+        'participant_phone' => $participantPhone,
+    ];
+};
+
+$normalizeGroupKey = static function (array $thread) use ($normalizePhoneKey, $extractGroupMetadata): string {
+    $groupMeta = $extractGroupMetadata($thread);
+    $chatId = $groupMeta['chat_id'] ?? '';
+    if ($chatId !== '') {
+        $slug = preg_replace('/[^a-z0-9]+/i', '', mb_strtolower($chatId, 'UTF-8'));
+        if ($slug !== '') {
+            return 'group-chat-' . $slug;
+        }
+    }
+
     $channelId = trim((string)($thread['channel_thread_id'] ?? ''));
     if ($channelId !== '') {
         $slug = preg_replace('/[^a-z0-9]+/i', '', mb_strtolower($channelId, 'UTF-8'));
@@ -906,7 +945,7 @@ $normalizeGroupKey = static function (array $thread) use ($normalizePhoneKey): s
         }
     }
 
-    $subject = trim((string)($thread['group_subject'] ?? ''));
+    $subject = trim((string)($groupMeta['subject'] ?? ''));
     if ($subject !== '') {
         $subjectSlug = preg_replace('/[^a-z0-9]+/i', '', mb_strtolower($subject, 'UTF-8'));
         if ($subjectSlug !== '') {
@@ -987,7 +1026,7 @@ $groupThreadsByContact = static function (array $threads) use ($normalizePhoneKe
 
 
 
-$renderCompactThread = static function (array $thread, array $options = []) use ($standaloneView, $formatTimestamp, $queueLabels, $agentsById, $activeThreadId, $buildWhatsappUrl, $describeThreadOrigin, $buildSearchIndex, $digitsOnly, $resolveThreadPhone, $compactPanels): string {
+$renderCompactThread = static function (array $thread, array $options = []) use ($standaloneView, $formatTimestamp, $queueLabels, $agentsById, $activeThreadId, $buildWhatsappUrl, $describeThreadOrigin, $buildSearchIndex, $digitsOnly, $resolveThreadPhone, $compactPanels, $extractGroupMetadata): string {
     $threadId = (int)($thread['id'] ?? 0);
 
     if ($threadId <= 0) {
@@ -1008,8 +1047,13 @@ $renderCompactThread = static function (array $thread, array $options = []) use 
 
     $clientId = (int)($thread['contact_client_id'] ?? 0);
 
-    $isGroupThread = !empty($thread['is_group']);
+    $isGroupThread = !empty($thread['is_group']) || (($thread['chat_type'] ?? '') === 'group');
+    $groupMeta = $isGroupThread ? $extractGroupMetadata($thread) : ['subject' => '', 'participant_name' => '', 'participant_phone' => ''];
+    $groupSubject = trim((string)($groupMeta['subject'] ?? ''));
     $displayName = trim((string)($thread['contact_display'] ?? ''));
+    if ($isGroupThread && $groupSubject !== '') {
+        $name = $groupSubject;
+    }
     if ($displayName !== '') {
         $name = $displayName;
     }
@@ -1116,6 +1160,7 @@ $renderCompactThread = static function (array $thread, array $options = []) use 
 
     $metaLines = [];
     $previewLine = null;
+    $participantNames = [];
 
 
 
@@ -1239,6 +1284,32 @@ $renderCompactThread = static function (array $thread, array $options = []) use 
 
         $metaLines[] = 'Linha: ' . implode(', ', array_values($lineLabels));
 
+    }
+
+    if ($isGroupThread) {
+        $referenceThreads = $groupThreads ?? [$thread];
+        foreach ($referenceThreads as $referenceThread) {
+            $metaRef = $extractGroupMetadata($referenceThread);
+            $pName = trim((string)($metaRef['participant_name'] ?? ''));
+            if ($pName === '') {
+                $pName = trim((string)($referenceThread['contact_display'] ?? $referenceThread['contact_name'] ?? ''));
+            }
+            if ($pName !== '') {
+                $participantNames[$pName] = $pName;
+            }
+        }
+        if ($participantNames !== []) {
+            $participants = array_values($participantNames);
+            sort($participants, SORT_NATURAL | SORT_FLAG_CASE);
+            $maxParticipants = 4;
+            $visible = array_slice($participants, 0, $maxParticipants);
+            $remaining = count($participants) - count($visible);
+            $label = implode(', ', $visible);
+            if ($remaining > 0) {
+                $label .= ' +' . $remaining;
+            }
+            $metaLines[] = 'Participantes: ' . $label;
+        }
     }
 
     $clientPayload = null;
@@ -2342,9 +2413,9 @@ foreach ($panelConfig as $panelKey => $panelData) {
                 <div id="wa-contact-profile-card" class="wa-card" style="display:none;margin-bottom:12px;">
                     <div style="display:flex;align-items:center;gap:12px;">
                         <?php if ($contactProfilePhoto !== null): ?>
-                            <img src="<?= htmlspecialchars($contactProfilePhoto, ENT_QUOTES, 'UTF-8'); ?>" alt="Foto do contato" style="width:54px;height:54px;border-radius:50%;object-fit:cover;border:1px solid rgba(148,163,184,0.25);" />
+                            <img src="<?= htmlspecialchars($contactProfilePhoto, ENT_QUOTES, 'UTF-8'); ?>" alt="Foto do contato" style="width:64px;height:64px;border-radius:50%;object-fit:cover;border:1px solid rgba(148,163,184,0.25);" />
                         <?php else: ?>
-                            <div style="width:54px;height:54px;border-radius:50%;background:rgba(148,163,184,0.2);display:flex;align-items:center;justify-content:center;color:#e2e8f0;font-weight:700;font-size:1.1rem;">
+                            <div style="width:64px;height:64px;border-radius:50%;background:rgba(148,163,184,0.2);display:flex;align-items:center;justify-content:center;color:#e2e8f0;font-weight:700;font-size:1.1rem;">
                                 <?= htmlspecialchars(strtoupper(mb_substr($contactProfileName !== '' ? $contactProfileName : 'C', 0, 1, 'UTF-8')), ENT_QUOTES, 'UTF-8'); ?>
                             </div>
                         <?php endif; ?>
@@ -2367,6 +2438,9 @@ foreach ($panelConfig as $panelKey => $panelData) {
                             <?php if ($contactGatewayCapturedAt > 0): ?>
                                 <span style="color:rgba(148,163,184,0.8);font-size:0.86rem;">Capturado: <?= htmlspecialchars($formatTimestamp($contactGatewayCapturedAt), ENT_QUOTES, 'UTF-8'); ?></span>
                             <?php endif; ?>
+                            <?php if ($contactLastInteractionAt !== null && $contactLastInteractionAt > 0): ?>
+                                <span style="color:rgba(148,163,184,0.8);font-size:0.86rem;">Última interação: <?= htmlspecialchars($formatTimestamp($contactLastInteractionAt), ENT_QUOTES, 'UTF-8'); ?></span>
+                            <?php endif; ?>
                         </div>
                     </div>
                     <div style="margin-top:10px;display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;">
@@ -2376,13 +2450,70 @@ foreach ($panelConfig as $panelKey => $panelData) {
                         <?php if (!empty($contactMetadata['cpf'])): ?>
                             <div><strong style="color:var(--muted);font-size:0.82rem;">Documento</strong><div><?= htmlspecialchars((string)$contactMetadata['cpf'], ENT_QUOTES, 'UTF-8'); ?></div></div>
                         <?php endif; ?>
+                        <?php if ($contactTags !== []): ?>
+                            <div><strong style="color:var(--muted);font-size:0.82rem;">Tags (CRM)</strong><div><?= htmlspecialchars(implode(', ', $contactTags), ENT_QUOTES, 'UTF-8'); ?></div></div>
+                        <?php endif; ?>
                         <?php if (!empty($contactMetadata['tags']) && is_array($contactMetadata['tags'])): ?>
                             <div><strong style="color:var(--muted);font-size:0.82rem;">Tags</strong><div><?= htmlspecialchars(implode(', ', $contactMetadata['tags']), ENT_QUOTES, 'UTF-8'); ?></div></div>
                         <?php endif; ?>
                         <?php if (!empty($contactMetadata['gateway_snapshot']['meta_message_id'])): ?>
                             <div><strong style="color:var(--muted);font-size:0.82rem;">Ult. meta_message_id</strong><div><?= htmlspecialchars((string)$contactMetadata['gateway_snapshot']['meta_message_id'], ENT_QUOTES, 'UTF-8'); ?></div></div>
                         <?php endif; ?>
+                        <?php if ($contactCreatedAt !== null): ?>
+                            <div><strong style="color:var(--muted);font-size:0.82rem;">Criado em</strong><div><?= htmlspecialchars($formatTimestamp($contactCreatedAt), ENT_QUOTES, 'UTF-8'); ?></div></div>
+                        <?php endif; ?>
+                        <?php if ($contactUpdatedAt !== null): ?>
+                            <div><strong style="color:var(--muted);font-size:0.82rem;">Atualizado em</strong><div><?= htmlspecialchars($formatTimestamp($contactUpdatedAt), ENT_QUOTES, 'UTF-8'); ?></div></div>
+                        <?php endif; ?>
                     </div>
+
+                    <?php if ($activeClientSummary !== null): ?>
+                        <hr style="border:0;border-top:1px solid rgba(148,163,184,0.25);margin:12px 0;">
+                        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px;">
+                            <?php if (!empty($activeClientSummary['document'])): ?>
+                                <div><strong style="color:var(--muted);font-size:0.82rem;">Documento</strong><div><?= htmlspecialchars((string)$activeClientSummary['document'], ENT_QUOTES, 'UTF-8'); ?></div></div>
+                            <?php endif; ?>
+                            <?php if (!empty($activeClientSummary['titular_name'])): ?>
+                                <div><strong style="color:var(--muted);font-size:0.82rem;">Titular</strong><div><?= htmlspecialchars((string)$activeClientSummary['titular_name'], ENT_QUOTES, 'UTF-8'); ?></div></div>
+                            <?php endif; ?>
+                            <?php if (!empty($activeClientSummary['titular_document'])): ?>
+                                <div><strong style="color:var(--muted);font-size:0.82rem;">Doc. Titular</strong><div><?= htmlspecialchars((string)$activeClientSummary['titular_document'], ENT_QUOTES, 'UTF-8'); ?></div></div>
+                            <?php endif; ?>
+                            <?php if (!empty($activeClientSummary['email'])): ?>
+                                <div><strong style="color:var(--muted);font-size:0.82rem;">E-mail CRM</strong><div><?= htmlspecialchars((string)$activeClientSummary['email'], ENT_QUOTES, 'UTF-8'); ?></div></div>
+                            <?php endif; ?>
+                            <?php if (!empty($activeClientSummary['whatsapp'])): ?>
+                                <div><strong style="color:var(--muted);font-size:0.82rem;">WhatsApp CRM</strong><div><?= htmlspecialchars((string)$activeClientSummary['whatsapp'], ENT_QUOTES, 'UTF-8'); ?></div></div>
+                            <?php endif; ?>
+                            <?php if (!empty($activeClientSummary['phone'])): ?>
+                                <div><strong style="color:var(--muted);font-size:0.82rem;">Telefone CRM</strong><div><?= htmlspecialchars((string)$activeClientSummary['phone'], ENT_QUOTES, 'UTF-8'); ?></div></div>
+                            <?php endif; ?>
+                            <?php if (!empty($activeClientSummary['status'])): ?>
+                                <div><strong style="color:var(--muted);font-size:0.82rem;">Status</strong><div><?= htmlspecialchars((string)$activeClientSummary['status'], ENT_QUOTES, 'UTF-8'); ?></div></div>
+                            <?php endif; ?>
+                            <?php if (!empty($activeClientSummary['partner'])): ?>
+                                <div><strong style="color:var(--muted);font-size:0.82rem;">Parceiro</strong><div><?= htmlspecialchars((string)$activeClientSummary['partner'], ENT_QUOTES, 'UTF-8'); ?></div></div>
+                            <?php endif; ?>
+                            <?php if (!empty($activeClientSummary['last_avp_name'])): ?>
+                                <div><strong style="color:var(--muted);font-size:0.82rem;">Último AVP</strong><div><?= htmlspecialchars((string)$activeClientSummary['last_avp_name'], ENT_QUOTES, 'UTF-8'); ?></div></div>
+                            <?php endif; ?>
+                            <?php if (!empty($activeClientSummary['pipeline_stage_id'])): ?>
+                                <div><strong style="color:var(--muted);font-size:0.82rem;">Pipeline</strong><div><?= htmlspecialchars((string)$activeClientSummary['pipeline_stage_id'], ENT_QUOTES, 'UTF-8'); ?></div></div>
+                            <?php endif; ?>
+                            <?php if (!empty($activeClientSummary['next_follow_up_at'])): ?>
+                                <div><strong style="color:var(--muted);font-size:0.82rem;">Próximo follow-up</strong><div><?= htmlspecialchars($formatTimestamp((int)$activeClientSummary['next_follow_up_at']), ENT_QUOTES, 'UTF-8'); ?></div></div>
+                            <?php endif; ?>
+                            <?php if (!empty($activeClientSummary['last_certificate_expires_at'])): ?>
+                                <div><strong style="color:var(--muted);font-size:0.82rem;">Certificado expira</strong><div><?= htmlspecialchars($formatTimestamp((int)$activeClientSummary['last_certificate_expires_at']), ENT_QUOTES, 'UTF-8'); ?></div></div>
+                            <?php endif; ?>
+                            <?php if (!empty($activeClientSummary['created_at'])): ?>
+                                <div><strong style="color:var(--muted);font-size:0.82rem;">Criado (CRM)</strong><div><?= htmlspecialchars($formatTimestamp((int)$activeClientSummary['created_at']), ENT_QUOTES, 'UTF-8'); ?></div></div>
+                            <?php endif; ?>
+                            <?php if (!empty($activeClientSummary['updated_at'])): ?>
+                                <div><strong style="color:var(--muted);font-size:0.82rem;">Atualizado (CRM)</strong><div><?= htmlspecialchars($formatTimestamp((int)$activeClientSummary['updated_at']), ENT_QUOTES, 'UTF-8'); ?></div></div>
+                            <?php endif; ?>
+                        </div>
+                    <?php endif; ?>
                 </div>
 
                 <?php $isClosedThread = strtolower((string)($activeThread['status'] ?? 'open')) === 'closed'; ?>

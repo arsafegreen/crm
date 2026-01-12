@@ -286,7 +286,7 @@ final class WhatsappThreadRepository
     {
         $sql =
             'SELECT t.*, c.name AS contact_name, c.phone AS contact_phone, c.client_id AS contact_client_id, p.name AS partner_name, u.name AS responsible_name,
-                    l.label AS line_label, l.display_phone AS line_display_phone, l.provider AS line_provider
+                      l.label AS line_label, l.display_phone AS line_display_phone, l.provider AS line_provider
              FROM whatsapp_threads t
              INNER JOIN whatsapp_contacts c ON c.id = t.contact_id
              LEFT JOIN partners p ON p.id = t.partner_id
@@ -303,11 +303,38 @@ final class WhatsappThreadRepository
         return $stmt->fetchAll(PDO::FETCH_ASSOC) ?: [];
     }
 
+    public function findGroupThreadsByChannelOrSubject(string $channelThreadId, string $subject, string $contactPhone = ''): array
+    {
+        $sql =
+            'SELECT t.*, c.name AS contact_name, c.phone AS contact_phone, c.client_id AS contact_client_id, p.name AS partner_name, u.name AS responsible_name,
+                      l.label AS line_label, l.display_phone AS line_display_phone, l.provider AS line_provider
+               FROM whatsapp_threads t
+               INNER JOIN whatsapp_contacts c ON c.id = t.contact_id
+               LEFT JOIN partners p ON p.id = t.partner_id
+               LEFT JOIN users u ON u.id = t.responsible_user_id
+               LEFT JOIN whatsapp_lines l ON l.id = t.line_id
+              WHERE t.chat_type = "group"
+                AND (
+                    (:channel IS NOT NULL AND :channel != "" AND t.channel_thread_id = :channel)
+                    OR (:subject IS NOT NULL AND :subject != "" AND t.group_subject = :subject)
+                    OR (:cphone IS NOT NULL AND :cphone != "" AND c.phone = :cphone)
+                )
+              ORDER BY (t.last_message_at IS NULL) ASC, t.last_message_at DESC, t.updated_at DESC';
+
+        $stmt = $this->pdo->prepare($sql);
+        $stmt->bindValue(':channel', $channelThreadId, PDO::PARAM_STR);
+        $stmt->bindValue(':subject', $subject, PDO::PARAM_STR);
+        $stmt->bindValue(':cphone', $contactPhone, PDO::PARAM_STR);
+        $stmt->execute();
+
+        return $stmt->fetchAll(PDO::FETCH_ASSOC) ?: [];
+    }
+
     public function listGroupIds(int $limit = 200): array
     {
         $sql =
             'SELECT t.id
-             FROM whatsapp_threads t
+               FROM whatsapp_threads t
              WHERE (t.status IS NULL OR t.status != "closed")
                AND t.chat_type = "group"
              ORDER BY (t.last_message_at IS NULL) ASC, t.last_message_at DESC, t.updated_at DESC

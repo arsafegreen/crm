@@ -315,6 +315,13 @@ final class WhatsappAltController
             $meta = [];
         }
 
+        if (!isset($meta['gateway_instance']) && isset($instance['slug']) && is_string($instance['slug']) && trim($instance['slug']) !== '') {
+            $meta['gateway_instance'] = trim((string)$instance['slug']);
+        }
+        if (!isset($meta['origin']) && isset($payload['origin']) && is_string($payload['origin'])) {
+            $meta['origin'] = $payload['origin'];
+        }
+
         if (!isset($meta['profile']) && isset($contactHint['name']) && is_string($contactHint['name'])) {
             $meta['profile'] = $contactHint['name'];
         }
@@ -357,16 +364,36 @@ final class WhatsappAltController
             return '';
         };
 
-        $hintPhone = $pickPhone([
-            $payload['phone'] ?? null,
-            $meta['participant']['phone'] ?? null,
-            $meta['phone'] ?? null,
-            $contactHint['phone'] ?? null,
-            $contactHint['wa_id'] ?? null,
-            $meta['wa_id'] ?? null,
-            $payload['wa_id'] ?? null,
-            $payload['from'] ?? null,
-        ]);
+        $payloadPhoneRaw = is_string($payload['phone'] ?? null) ? trim((string)$payload['phone']) : '';
+        $metaChatType = strtolower(trim((string)($meta['chat_type'] ?? '')));
+        $isGroupMessage = ($payloadPhoneRaw !== '' && str_starts_with($payloadPhoneRaw, 'group:'))
+            || $metaChatType === 'group'
+            || (!empty($meta['is_group']))
+            || str_contains((string)($meta['chat_id'] ?? ''), '@g.us')
+            || str_contains((string)($meta['group_jid'] ?? ''), '@g.us');
+
+        if ($isGroupMessage) {
+            $candidate = (string)($meta['group_jid'] ?? ($meta['chat_id'] ?? $payloadPhoneRaw));
+            if ($candidate !== '') {
+                $hintPhone = str_starts_with($candidate, 'group:') ? $candidate : ('group:' . $candidate);
+            } else {
+                $hintPhone = 'group:' . ($payloadPhoneRaw !== '' ? $payloadPhoneRaw : 'unknown');
+            }
+        } else {
+            $hintPhone = $pickPhone([
+                $payloadPhoneRaw !== '' ? $payloadPhoneRaw : null,
+                $meta['participant']['phone'] ?? null,
+                $meta['phone'] ?? null,
+                $meta['chat_id'] ?? null,
+                $meta['group_jid'] ?? null,
+                $meta['message_id'] ?? null,
+                $contactHint['phone'] ?? null,
+                $contactHint['wa_id'] ?? null,
+                $meta['wa_id'] ?? null,
+                $payload['wa_id'] ?? null,
+                $payload['from'] ?? null,
+            ]);
+        }
 
         if (!isset($meta['meta_message_id']) && isset($meta['message_id'])) {
             $meta['meta_message_id'] = $meta['message_id'];
@@ -413,7 +440,7 @@ final class WhatsappAltController
             $mediaPayload = null;
         }
 
-        $rawPhone = $hintPhone !== '' ? $hintPhone : (string)($payload['phone'] ?? '');
+        $rawPhone = $hintPhone !== '' ? $hintPhone : $payloadPhoneRaw;
 
         // Se o gateway mandou um ID (ou vazio), tenta extrair telefone de outras pistas
         $phoneCandidates = [
@@ -426,11 +453,23 @@ final class WhatsappAltController
         if (is_array($participantMeta)) {
             $phoneCandidates[] = (string)($participantMeta['phone'] ?? '');
         }
-        $rawPhone = $this->pickLikelyPhone($phoneCandidates);
 
-        $mappedPhone = $this->mapAltJidToPhone($rawPhone, $meta);
-        if ($mappedPhone !== null) {
-            $rawPhone = $mappedPhone;
+        if (!$isGroupMessage) {
+            $messageId = (string)($meta['meta_message_id'] ?? ($meta['message_id'] ?? ''));
+            $chatId = (string)($meta['chat_id'] ?? '');
+            $hasPrivacyJid = !empty($meta['privacy_jid']) || str_contains($messageId, '@lid') || str_contains($chatId, '@lid');
+            if ($hasPrivacyJid && $chatId !== '') {
+                array_unshift($phoneCandidates, $chatId);
+                $rawPhone = $chatId;
+            }
+        }
+        if (!$isGroupMessage) {
+            $rawPhone = $this->pickLikelyPhone($phoneCandidates);
+
+            $mappedPhone = $this->mapAltJidToPhone($rawPhone, $meta);
+            if ($mappedPhone !== null) {
+                $rawPhone = $mappedPhone;
+            }
         }
 
         $normalizedPhone = $this->normalizeWebhookPhone($instance, $rawPhone, $meta);
@@ -651,6 +690,32 @@ final class WhatsappAltController
 
     private function normalizeWebhookPhone(array $instance, string $rawPhone, array $meta = []): string
     {
+        $metaChatType = strtolower(trim((string)($meta['chat_type'] ?? '')));
+        $isGroupCandidate = str_starts_with($rawPhone, 'group:')
+            || $metaChatType === 'group'
+            || (!empty($meta['is_group']))
+            || str_contains((string)($meta['chat_id'] ?? ''), '@g.us')
+            || str_contains((string)($meta['group_jid'] ?? ''), '@g.us');
+
+        if ($isGroupCandidate) {
+            $candidate = $rawPhone;
+            if (!str_starts_with($candidate, 'group:')) {
+                $candidate = (string)($meta['group_jid'] ?? ($meta['chat_id'] ?? $candidate));
+            }
+            if (str_starts_with($candidate, 'group:')) {
+                $candidate = substr($candidate, 6);
+            }
+            if (str_contains($candidate, '@')) {
+                $candidate = substr($candidate, 0, strpos($candidate, '@'));
+            }
+            $normalized = preg_replace('/[^a-zA-Z0-9]+/', '', $candidate) ?: '';
+            if ($normalized !== '') {
+                return 'group:' . strtolower($normalized);
+            }
+            $digitsOnly = preg_replace('/\D+/', '', $candidate) ?: '';
+            return $digitsOnly !== '' ? 'group:' . $digitsOnly : $rawPhone;
+        }
+
         // Se houver mapeamento manual de JID alt -> telefone real, aplica antes de qualquer fallback.
         $mappedPhone = $this->mapAltJidToPhone($rawPhone, $meta);
 
@@ -693,8 +758,32 @@ final class WhatsappAltController
 
         $event = strtolower((string)($payload['event'] ?? ''));
         $fromMe = (bool)($data['fromMe'] ?? false);
-        $chatId = (string)($data['chatId'] ?? ($data['sender']['id'] ?? ''));
-        $waId = preg_replace('/\D+/', '', $chatId) ?: '';
+        $chatIdRaw = (string)($data['chatId'] ?? ($data['sender']['id'] ?? ''));
+        $senderIdRaw = (string)($data['sender']['id'] ?? ($data['from'] ?? ''));
+        $chatDigits = preg_replace('/\D+/', '', $chatIdRaw) ?: '';
+        $senderDigits = preg_replace('/\D+/', '', $senderIdRaw) ?: '';
+        $isPrivacyJid = str_contains($chatIdRaw, '@lid');
+        $isGroupMsg = (bool)($data['isGroupMsg'] ?? false);
+
+        $waId = $chatDigits;
+        // Corrige wppconnect que manda @lid ou IDs enormes: prioriza senderId e trunca para caber em MSISDN.
+        $looksInvalid = ($waId === '') || strlen($waId) > 15;
+        if ($isPrivacyJid || $looksInvalid) {
+            $waId = '';
+            if ($senderDigits !== '') {
+                $waId = strlen($senderDigits) > 15 ? substr($senderDigits, -15) : $senderDigits;
+            }
+        }
+        if ($waId === '' && $chatDigits !== '') {
+            $waId = strlen($chatDigits) > 15 ? substr($chatDigits, -15) : $chatDigits;
+        }
+        if (!$isGroupMsg && $waId !== '' && strlen($waId) >= 10 && strlen($waId) <= 11 && !str_starts_with($waId, '55')) {
+            $waId = '55' . $waId;
+        }
+        if (!$isGroupMsg && strlen($waId) > 15) {
+            $waId = substr($waId, -15);
+        }
+
         $direction = $event === 'onack' ? 'ack' : ($fromMe ? 'outgoing' : 'incoming');
 
         $msgId = null;
@@ -707,14 +796,42 @@ final class WhatsappAltController
         $meta = [
             'message_id' => $msgId,
             'meta_message_id' => $msgId,
-            'chat_id' => $chatId,
+            'chat_id' => $chatIdRaw,
             'timestamp' => $data['timestamp'] ?? null,
             'gateway_instance' => $instanceSlug,
             'from_me' => $fromMe,
             'raw_type' => $data['type'] ?? null,
             'ack' => $data['ack'] ?? null,
-            'is_group' => (bool)($data['isGroupMsg'] ?? false),
+            'is_group' => $isGroupMsg,
+            'sender_id' => $senderIdRaw,
+            'sender_id_digits' => $senderDigits,
+            'privacy_jid' => $isPrivacyJid,
         ];
+        if ($isGroupMsg) {
+            $meta['chat_type'] = 'group';
+            $meta['group_jid'] = $chatIdRaw !== '' ? $chatIdRaw : null;
+            $meta['group_subject'] = $data['chat']['name'] ?? $data['chat']['formattedTitle'] ?? $data['chat']['subject'] ?? null;
+
+            $participantId = $data['author'] ?? ($data['id']['participant'] ?? null) ?? $senderIdRaw;
+            $participantDigits = is_string($participantId) ? (preg_replace('/\D+/', '', $participantId) ?: '') : '';
+            $meta['group_participant'] = array_filter([
+                'phone' => $participantDigits !== '' ? $participantDigits : null,
+                'name' => $data['sender']['pushname'] ?? ($data['sender']['name'] ?? null),
+            ], static fn($value) => $value !== null && $value !== '');
+
+            $groupCandidate = $chatIdRaw;
+            if (str_contains($groupCandidate, '@')) {
+                $groupCandidate = substr($groupCandidate, 0, strpos($groupCandidate, '@'));
+            }
+            $groupNormalized = preg_replace('/[^a-zA-Z0-9]+/', '', $groupCandidate) ?: '';
+            if ($groupNormalized !== '') {
+                $waId = 'group:' . strtolower($groupNormalized);
+            } elseif ($chatDigits !== '') {
+                $waId = 'group:' . $chatDigits;
+            } else {
+                $waId = 'group:' . ($senderDigits !== '' ? $senderDigits : 'unknown');
+            }
+        }
 
         $contactHint = [
             'name' => $data['sender']['pushname'] ?? ($data['sender']['name'] ?? null),

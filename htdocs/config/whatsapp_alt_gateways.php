@@ -4,7 +4,7 @@ $projectRoot = dirname(__DIR__);
 $gatewayDir = $projectRoot . DIRECTORY_SEPARATOR . 'services' . DIRECTORY_SEPARATOR . 'whatsapp-web-gateway';
 
 return [
-    'default_instance' => 'lab01',
+    'default_instance' => 'wpp01',
     'default_daily_limit' => (int)env('WHATSAPP_ALT_DEFAULT_DAILY_LIMIT', 250),
     'rotation_window_hours' => (int)env('WHATSAPP_ALT_ROTATION_WINDOW_HOURS', 24),
     'per_number_window_hours' => (float)env('WHATSAPP_ALT_PER_NUMBER_WINDOW_HOURS', 0.1667), // ~10 minutos
@@ -22,7 +22,7 @@ return [
             'default_line_label' => 'WhatsApp Web alternativo',
             'session_hint' => 'crm-sandbox',
             'daily_limit' => (int)env('WHATSAPP_ALT_GATEWAY_LAB01_DAILY_LIMIT', 250),
-            'enabled' => true,
+            'enabled' => false,
         ],
         'lab02' => [
             'label' => 'Gateway laboratorio 02',
@@ -34,7 +34,7 @@ return [
             'default_line_label' => 'WhatsApp Web alternativo 02',
             'session_hint' => 'crm-sandbox-02',
             'daily_limit' => (int)env('WHATSAPP_ALT_GATEWAY_LAB02_DAILY_LIMIT', 250),
-            'enabled' => true,
+            'enabled' => false,
         ],
         'lab03' => [
             'label' => 'Gateway laboratorio 03',
@@ -46,7 +46,7 @@ return [
             'default_line_label' => 'WhatsApp Web alternativo 03',
             'session_hint' => 'crm-sandbox-03',
             'daily_limit' => (int)env('WHATSAPP_ALT_GATEWAY_LAB03_DAILY_LIMIT', 250),
-            'enabled' => true,
+            'enabled' => false,
         ],
         'lab04' => [
             'label' => 'Gateway laboratorio 04',
@@ -58,7 +58,7 @@ return [
             'default_line_label' => 'WhatsApp Web alternativo 04',
             'session_hint' => 'crm-sandbox-04',
             'daily_limit' => (int)env('WHATSAPP_ALT_GATEWAY_LAB04_DAILY_LIMIT', 250),
-            'enabled' => true,
+            'enabled' => false,
         ],
         'lab05' => [
             'label' => 'Gateway laboratorio 05',
@@ -70,7 +70,7 @@ return [
             'default_line_label' => 'WhatsApp Web alternativo 05',
             'session_hint' => 'crm-sandbox-05',
             'daily_limit' => (int)env('WHATSAPP_ALT_GATEWAY_LAB05_DAILY_LIMIT', 250),
-            'enabled' => true,
+            'enabled' => false,
         ],
         'lab06' => [
             'label' => 'Gateway laboratorio 06',
@@ -82,7 +82,7 @@ return [
             'default_line_label' => 'WhatsApp Web alternativo 06',
             'session_hint' => 'crm-sandbox-06',
             'daily_limit' => (int)env('WHATSAPP_ALT_GATEWAY_LAB06_DAILY_LIMIT', 250),
-            'enabled' => true,
+            'enabled' => false,
         ],
         'lab07' => [
             'label' => 'Gateway laboratorio 07',
@@ -94,7 +94,7 @@ return [
             'default_line_label' => 'WhatsApp Web alternativo 07',
             'session_hint' => 'crm-sandbox-07',
             'daily_limit' => (int)env('WHATSAPP_ALT_GATEWAY_LAB07_DAILY_LIMIT', 250),
-            'enabled' => true,
+            'enabled' => false,
         ],
         'lab08' => [
             'label' => 'Gateway laboratorio 08',
@@ -106,7 +106,7 @@ return [
             'default_line_label' => 'WhatsApp Web alternativo 08',
             'session_hint' => 'crm-sandbox-08',
             'daily_limit' => (int)env('WHATSAPP_ALT_GATEWAY_LAB08_DAILY_LIMIT', 250),
-            'enabled' => true,
+            'enabled' => false,
         ],
         'lab09' => [
             'label' => 'Gateway laboratorio 09',
@@ -118,7 +118,7 @@ return [
             'default_line_label' => 'WhatsApp Web alternativo 09',
             'session_hint' => 'crm-sandbox-09',
             'daily_limit' => (int)env('WHATSAPP_ALT_GATEWAY_LAB09_DAILY_LIMIT', 250),
-            'enabled' => true,
+            'enabled' => false,
         ],
         'wpp01' => [
             'label' => 'Gateway WPPConnect 01',
@@ -132,6 +132,42 @@ return [
             'daily_limit' => (int)env('WHATSAPP_ALT_GATEWAY_WPP01_DAILY_LIMIT', 250),
             'enabled' => true,
         ],
+        'wpp02' => [
+            'label' => 'Gateway WPPConnect 02',
+            'description' => 'Instância QR 02 (payload completo, fotos, wa_id).',
+            'base_url' => env('WHATSAPP_ALT_GATEWAY_WPP02_URL', 'http://192.168.1.137:4110'),
+            'start_command' => $gatewayDir . DIRECTORY_SEPARATOR . 'start-gateway-wpp02.bat',
+            'command_token' => env('WHATSAPP_ALT_GATEWAY_WPP02_COMMAND_TOKEN', 'alterar-token-envio-wpp02'),
+            'webhook_token' => env('WHATSAPP_ALT_GATEWAY_WPP02_WEBHOOK_TOKEN', 'alterar-token-webhook-wpp02'),
+            'default_line_label' => 'WhatsApp Web alternativo WPP 02',
+            'session_hint' => 'wppconnect-02',
+            'daily_limit' => (int)env('WHATSAPP_ALT_GATEWAY_WPP02_DAILY_LIMIT', 250),
+            'enabled' => true,
+        ],
+        'wpp03' => [
+            'label' => 'Gateway WPPConnect 03',
+            'description' => 'Instância QR 03 (payload completo, fotos, wa_id).',
+            'base_url' => env('WHATSAPP_ALT_GATEWAY_WPP03_URL', 'http://192.168.1.137:4120'),
+            'start_command' => $gatewayDir . DIRECTORY_SEPARATOR . 'start-gateway-wpp03.bat',
+            'command_token' => env('WHATSAPP_ALT_GATEWAY_WPP03_COMMAND_TOKEN', 'alterar-token-envio-wpp03'),
+            'webhook_token' => env('WHATSAPP_ALT_GATEWAY_WPP03_WEBHOOK_TOKEN', 'alterar-token-webhook-wpp03'),
+            'default_line_label' => 'WhatsApp Web alternativo WPP 03',
+            'session_hint' => 'wppconnect-03',
+            'daily_limit' => (int)env('WHATSAPP_ALT_GATEWAY_WPP03_DAILY_LIMIT', 250),
+            'enabled' => true,
+        ],
+        'wpp04' => [
+            'label' => 'Gateway WPPConnect 04',
+            'description' => 'Instância QR 04 (payload completo, fotos, wa_id).',
+            'base_url' => env('WHATSAPP_ALT_GATEWAY_WPP04_URL', 'http://192.168.1.137:4130'),
+            'start_command' => $gatewayDir . DIRECTORY_SEPARATOR . 'start-gateway-wpp04.bat',
+            'command_token' => env('WHATSAPP_ALT_GATEWAY_WPP04_COMMAND_TOKEN', 'alterar-token-envio-wpp04'),
+            'webhook_token' => env('WHATSAPP_ALT_GATEWAY_WPP04_WEBHOOK_TOKEN', 'alterar-token-webhook-wpp04'),
+            'default_line_label' => 'WhatsApp Web alternativo WPP 04',
+            'session_hint' => 'wppconnect-04',
+            'daily_limit' => (int)env('WHATSAPP_ALT_GATEWAY_WPP04_DAILY_LIMIT', 250),
+            'enabled' => true,
+        ],
         'lab00' => [
             'label' => 'Gateway laboratorio 00',
             'description' => 'Instancia adicional de testes (porta 4000).',
@@ -142,7 +178,7 @@ return [
             'default_line_label' => 'WhatsApp Web alternativo 00',
             'session_hint' => 'crm-sandbox-00',
             'daily_limit' => (int)env('WHATSAPP_ALT_GATEWAY_LAB00_DAILY_LIMIT', 250),
-            'enabled' => true,
+            'enabled' => false,
         ],
     ],
 ];

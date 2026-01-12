@@ -50,8 +50,9 @@ final class WhatsappController
         }
 
         $channel = $this->normalizeChannel((string)$request->query->get('channel', ''));
+        $standaloneView = $request->query->get('standalone') === '1';
 
-        // Carrega painéis imediatamente (padrão false) para não ficar vazio no standalone.
+        // Mantém carregamento imediato por padrão para não deixar a tela vazia.
         $deferPanels = $request->query->getBoolean('defer_panels', false);
 
         $threadId = (int)$request->query->get('thread');
@@ -90,6 +91,7 @@ final class WhatsappController
             'selectedChannel' => $channel,
             'deferPanels' => $deferPanels,
             'queueSummary' => $queueSummary,
+            'standalone' => $standaloneView,
         ]));
     }
 
@@ -120,6 +122,8 @@ final class WhatsappController
         if ($pageLimit > 50) {
             $pageLimit = 50;
         }
+        $isStandalone = $request->query->get('standalone') === '1';
+        $fastMode = $request->query->getBoolean('fast', $isStandalone);
 
         try {
             if ($beforeId > 0) {
@@ -143,7 +147,7 @@ final class WhatsappController
             'last_message_id' => $result['last_message_id'],
             'thread_unread' => $result['thread']['unread_count'] ?? 0,
             'contact' => $result['contact'] ?? null,
-            'queue_summary' => $this->service->queueSummary(),
+            'queue_summary' => $fastMode ? null : $this->service->queueSummary(),
         ]);
     }
 

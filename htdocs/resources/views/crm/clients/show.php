@@ -173,7 +173,10 @@ $addressLabel = $addressSegments !== [] ? implode(' • ', $addressSegments) : n
 $emailValue = $client['email'] ?? '';
 $phoneDigitsValue = digits_only($client['phone'] ?? '');
 $whatsappDigitsValue = digits_only($client['whatsapp'] ?? '');
-$whatsappThreadUrlTemplate = url('whatsapp') . '?thread=__THREAD__&panel=entrada&standalone=1&conversation_only=1&channel=alt';
+$whatsappThreadUrlTemplate = url('whatsapp') . '?thread=__THREAD__&panel=entrada&standalone=1&conversation_only=1&channel=alt_wpp';
+$whatsappPrimaryGateway = 'wpp01';
+$whatsappFallbackGateway = 'wpp02';
+$whatsappChannel = 'alt_wpp';
 $manualStartMessage = 'Olá! Podemos falar pelo WhatsApp?';
 $extraPhonesValue = [];
 $rawExtraPhones = $client['extra_phones'] ?? [];
@@ -711,6 +714,9 @@ $clientMarkEndpoint = url('crm/clients/' . (int)($client['id'] ?? 0) . '/marks')
                         data-contact-phone="<?= htmlspecialchars($whatsappContactPhone, ENT_QUOTES, 'UTF-8'); ?>"
                         data-contact-cpf="<?= htmlspecialchars($cpfDigits, ENT_QUOTES, 'UTF-8'); ?>"
                         data-initial-queue="concluidos"
+                        data-channel="<?= htmlspecialchars($whatsappChannel, ENT_QUOTES, 'UTF-8'); ?>"
+                        data-gateway-instance="<?= htmlspecialchars($whatsappPrimaryGateway, ENT_QUOTES, 'UTF-8'); ?>"
+                        data-gateway-fallback="<?= htmlspecialchars($whatsappFallbackGateway, ENT_QUOTES, 'UTF-8'); ?>"
                         hidden></div>
                     <div style="margin-top:14px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;">
                         <?php if ($birthdateTimestamp !== null): ?>
@@ -1468,6 +1474,9 @@ document.addEventListener('DOMContentLoaded', function () {
     const contactPhone = whatsappConfig.getAttribute('data-contact-phone') || '';
     const contactCpf = whatsappConfig.getAttribute('data-contact-cpf') || '';
     const initialQueue = whatsappConfig.getAttribute('data-initial-queue') || '';
+    const gatewayInstance = whatsappConfig.getAttribute('data-gateway-instance') || '';
+    const gatewayFallback = whatsappConfig.getAttribute('data-gateway-fallback') || '';
+    const channel = whatsappConfig.getAttribute('data-channel') || '';
 
     if (contactPhone === '') {
         return;
@@ -1490,7 +1499,7 @@ document.addEventListener('DOMContentLoaded', function () {
         return 'https://api.whatsapp.com/send/?' + params.toString();
     };
 
-    const sendWhatsappThread = async function (message, kind) {
+    const sendWhatsappThread = async function (message, kind, preferredGateway) {
         if (!endpoint) {
             throw new Error('Canal do CRM indisponível.');
         }
@@ -1507,6 +1516,13 @@ document.addEventListener('DOMContentLoaded', function () {
         }
         if (kind === 'birthday' && contactCpf) {
             payload.set('campaign_token', contactCpf);
+        }
+        if (channel) {
+            payload.set('channel', channel);
+        }
+        const chosenGateway = preferredGateway || gatewayInstance;
+        if (chosenGateway) {
+            payload.set('gateway_instance', chosenGateway);
         }
         if (window.CSRF_TOKEN) {
             payload.set('_token', window.CSRF_TOKEN);
@@ -1569,7 +1585,20 @@ document.addEventListener('DOMContentLoaded', function () {
         }
 
         try {
-            await sendWhatsappThread(message, trigger.getAttribute('data-whatsapp-kind') || '');
+            let lastError = null;
+            try {
+                await sendWhatsappThread(message, trigger.getAttribute('data-whatsapp-kind') || '', gatewayInstance);
+            } catch (error) {
+                lastError = error;
+                if (gatewayFallback && gatewayFallback !== gatewayInstance) {
+                    await sendWhatsappThread(message, trigger.getAttribute('data-whatsapp-kind') || '', gatewayFallback);
+                    lastError = null;
+                }
+            }
+
+            if (lastError) {
+                throw lastError;
+            }
         } catch (error) {
             const fallbackUrl = buildWhatsappFallback(message);
             if (fallbackUrl) {

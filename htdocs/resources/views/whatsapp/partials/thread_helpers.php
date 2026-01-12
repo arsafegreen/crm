@@ -200,9 +200,50 @@ if (!function_exists('wa_normalize_phone_key')) {
 if (!function_exists('wa_normalize_group_key')) {
     /**
      * @param array<string,mixed> $thread
+     * @return array{chat_id:string,subject:string,participant_name:string,participant_phone:string}
+     */
+    function wa_extract_group_metadata(array $thread): array
+    {
+        $rawMeta = $thread['group_metadata'] ?? [];
+        if (is_string($rawMeta) && trim($rawMeta) !== '') {
+            $decoded = json_decode($rawMeta, true);
+            if (is_array($decoded)) {
+                $rawMeta = $decoded;
+            }
+        }
+        $meta = is_array($rawMeta) ? $rawMeta : [];
+
+        $subject = trim((string)($thread['group_subject'] ?? ($meta['subject'] ?? '')));
+        $chatId = trim((string)($meta['chat_id'] ?? ''));
+
+        $participant = isset($meta['participant']) && is_array($meta['participant']) ? $meta['participant'] : [];
+        $participantName = trim((string)($participant['name'] ?? ''));
+        $participantPhone = trim((string)($participant['phone'] ?? ''));
+
+        return [
+            'chat_id' => $chatId,
+            'subject' => $subject,
+            'participant_name' => $participantName,
+            'participant_phone' => $participantPhone,
+        ];
+    }
+}
+
+if (!function_exists('wa_normalize_group_key')) {
+    /**
+     * @param array<string,mixed> $thread
      */
     function wa_normalize_group_key(array $thread): string
     {
+        $groupMeta = wa_extract_group_metadata($thread);
+        $chatId = $groupMeta['chat_id'];
+        if ($chatId !== '') {
+            $slug = preg_replace('/[^a-z0-9]+/i', '', mb_strtolower($chatId, 'UTF-8'));
+            if ($slug !== '') {
+                return 'group-chat-' . $slug;
+            }
+        }
+
         $channelId = trim((string)($thread['channel_thread_id'] ?? ''));
         if ($channelId !== '') {
             $slug = preg_replace('/[^a-z0-9]+/i', '', mb_strtolower($channelId, 'UTF-8'));
@@ -211,7 +252,7 @@ if (!function_exists('wa_normalize_group_key')) {
             }
         }
 
-        $subject = trim((string)($thread['group_subject'] ?? ''));
+        $subject = $groupMeta['subject'];
         if ($subject !== '') {
             $subjectSlug = preg_replace('/[^a-z0-9]+/i', '', mb_strtolower($subject, 'UTF-8'));
             if ($subjectSlug !== '') {
@@ -422,6 +463,11 @@ if (!function_exists('wa_prepare_thread_view')) {
 
         $displayName = trim((string)($thread['contact_display'] ?? ''));
         $isGroupThread = !empty($thread['is_group']) || (($thread['chat_type'] ?? '') === 'group');
+        $groupMeta = $isGroupThread ? wa_extract_group_metadata($thread) : ['chat_id' => '', 'subject' => '', 'participant_name' => '', 'participant_phone' => ''];
+        $groupSubject = trim((string)$groupMeta['subject']);
+        if ($isGroupThread && $groupSubject !== '') {
+            $name = $groupSubject;
+        }
         if ($displayName !== '') {
             $name = $displayName;
         }
@@ -564,6 +610,7 @@ if (!function_exists('wa_prepare_thread_view')) {
         $referenceThreads = $groupThreads ?? [$thread];
         $assignedNames = [];
         $lineLabels = [];
+        $participantNames = [];
         foreach ($referenceThreads as $referenceThread) {
             $assignedUserId = (int)($referenceThread['assigned_user_id'] ?? 0);
             if ($assignedUserId > 0 && isset($agentsById[$assignedUserId])) {
@@ -573,6 +620,14 @@ if (!function_exists('wa_prepare_thread_view')) {
             $label = trim((string)$originRef['label']);
             if ($label !== '') {
                 $lineLabels[$label] = $label;
+            }
+
+            $metaRef = !empty($referenceThread['is_group']) || (($referenceThread['chat_type'] ?? '') === 'group')
+                ? wa_extract_group_metadata($referenceThread)
+                : ['participant_name' => ''];
+            $participantName = trim((string)($metaRef['participant_name'] ?? ''));
+            if ($participantName !== '') {
+                $participantNames[$participantName] = $participantName;
             }
         }
 
@@ -591,6 +646,18 @@ if (!function_exists('wa_prepare_thread_view')) {
         }
         if ($showLine && $lineLabels !== [] && !$isCompactPanel) {
             $metaLines[] = 'Linha: ' . implode(', ', array_values($lineLabels));
+        }
+        if ($isGroupThread && $participantNames !== []) {
+            $participantList = array_values($participantNames);
+            sort($participantList, SORT_NATURAL | SORT_FLAG_CASE);
+            $maxParticipants = 4;
+            $visible = array_slice($participantList, 0, $maxParticipants);
+            $remaining = count($participantList) - count($visible);
+            $label = implode(', ', $visible);
+            if ($remaining > 0) {
+                $label .= ' +' . $remaining;
+            }
+            $metaLines[] = 'Participantes: ' . $label;
         }
 
         $clientPayload = null;

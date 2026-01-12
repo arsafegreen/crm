@@ -8,17 +8,18 @@
     const whatsappMediaBaseUrl = <?= json_encode(rtrim(url('whatsapp/media'), '/'), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE); ?>;
     const threadPollEndpoint = <?= json_encode(url('whatsapp/thread-poll'), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE); ?>;
     const panelRefreshEndpoint = <?= json_encode(url('whatsapp/panel-refresh'), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE); ?>;
-    const THREAD_POLL_INTERVAL = 5000;
-    const THREAD_POLL_IDLE_INTERVAL = 30000;
-    const THREAD_POLL_BACKGROUND_INTERVAL = 30000;
+    const THREAD_POLL_INTERVAL = 2000;
+    const THREAD_POLL_IDLE_INTERVAL = 12000;
+    const THREAD_POLL_BACKGROUND_INTERVAL = 15000;
     const THREAD_PREFETCH_LIMIT = 4;
     const THREAD_HISTORY_PAGE_SIZE = 40;
-    const PANEL_REFRESH_INTERVAL = 12000;
-    const PANEL_REFRESH_BACKGROUND_INTERVAL = 30000;
-    const PANEL_REFRESH_IDLE_INTERVAL = 20000;
+    const PANEL_REFRESH_INTERVAL = 5000;
+    const PANEL_REFRESH_BACKGROUND_INTERVAL = 15000;
+    const PANEL_REFRESH_IDLE_INTERVAL = 5000;
     const INITIAL_MESSAGE_RENDER_LIMIT = 120;
     const LAZY_MEDIA_PLACEHOLDER = 'data:image/gif;base64,R0lGODlhAQABAAAAACw=';
     const IDLE_THRESHOLD_MS = 2 * 60 * 1000;
+    const isStandalone = <?= !empty($standalone) ? 'true' : 'false'; ?>;
     const selectedChannel = <?= json_encode($selectedChannel ?? '', JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES); ?>;
     const deferPanels = <?= !empty($deferPanels) ? 'true' : 'false'; ?>;
     const activeThreadContext = {
@@ -41,6 +42,7 @@
     let panelRefreshTimer = null;
     let isPanelRefreshing = false;
     let panelRefreshController = null;
+    let lastAuthReloadAt = 0;
     let threadNavigationLocked = false;
 
     const mediaTemplates = <?= json_encode($mediaTemplates, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES); ?>;
@@ -105,6 +107,14 @@
     const notifySoundFeedback = document.querySelector('[data-notify-sound-feedback]');
     const notifySoundClearButton = document.querySelector('[data-notify-clear-sound]');
     const notifyTestSoundButton = document.querySelector('[data-notify-test-sound]');
+
+    function applyStandaloneParams(params) {
+        if (!params || !isStandalone) {
+            return;
+        }
+        params.set('standalone', '1');
+        params.set('fast', '1');
+    }
 
     // Monitor de disponibilidade dos gateways (toast único e elegante)
     const gatewayFleetStatus = new Map();
@@ -3005,6 +3015,7 @@
             thread_id: String(threadId),
             last_message_id: String(lastMessageId || 0),
         });
+        applyStandaloneParams(params);
         try {
             const response = await fetch(`${threadPollEndpoint}?${params.toString()}`, {
                 headers: { Accept: 'application/json' },
@@ -3012,6 +3023,16 @@
                 signal: threadPollController.signal,
             });
             if (!response.ok) {
+                return;
+            }
+            const contentType = response.headers.get('content-type') || '';
+            if (!contentType.includes('application/json')) {
+                const now = Date.now();
+                if (now - lastAuthReloadAt > 15000) {
+                    lastAuthReloadAt = now;
+                    console.warn('Resposta inesperada no poll (provavel login expirado). Recarregando...');
+                    window.location.reload();
+                }
                 return;
             }
             const payload = await response.json();
@@ -3070,6 +3091,7 @@
             before_id: String(cursor),
             limit: String(THREAD_HISTORY_PAGE_SIZE),
         });
+        applyStandaloneParams(params);
 
         const previousHeight = messagesContainer.scrollHeight;
         const previousScrollTop = messagesContainer.scrollTop;
@@ -3081,6 +3103,16 @@
             });
             if (!response.ok) {
                 throw new Error('Falha ao carregar mensagens antigas.');
+            }
+            const contentType = response.headers.get('content-type') || '';
+            if (!contentType.includes('application/json')) {
+                const now = Date.now();
+                if (now - lastAuthReloadAt > 15000) {
+                    lastAuthReloadAt = now;
+                    console.warn('Resposta inesperada ao carregar histórico (provavel login expirado). Recarregando...');
+                    window.location.reload();
+                }
+                return;
             }
             const payload = await response.json();
             const olderMessages = (payload && Array.isArray(payload.messages)) ? payload.messages : [];
@@ -3172,16 +3204,17 @@
         if (threadSearchInput && threadSearchInput.value) {
             params.set('search', threadSearchInput.value);
         }
+        applyStandaloneParams(params);
         return `${panelRefreshEndpoint}?${params.toString()}`;
     }
 
     async function refreshPanels(options = {}) {
         if (!panelRefreshEndpoint || isPanelRefreshing) {
-            return;
+            return Promise.resolve();
         }
         const refreshUrl = buildPanelRefreshUrl();
         if (!refreshUrl) {
-            return;
+            return Promise.resolve();
         }
 
         const skipNotifications = Boolean(options.skipNotifications || document.hidden);
@@ -3211,6 +3244,16 @@
             if (!response.ok) {
                 return;
             }
+            const contentType = response.headers.get('content-type') || '';
+            if (!contentType.includes('application/json')) {
+                const now = Date.now();
+                if (now - lastAuthReloadAt > 15000) {
+                    lastAuthReloadAt = now;
+                    console.warn('Resposta inesperada no refresh (provavel login expirado). Recarregando...');
+                    window.location.reload();
+                }
+                return;
+            }
             const data = await response.json().catch(() => null);
             if (data && data.panels) {
                 applyPanelSnapshot(data.panels, { skipNotifications });
@@ -3226,6 +3269,8 @@
             isPanelRefreshing = false;
             panelRefreshController = null;
         }
+
+        return Promise.resolve();
     }
 
     function applyPanelSnapshot(panels, options = {}) {
@@ -3259,6 +3304,7 @@
             last_message_id: '0',
             prefetch: '1',
         });
+        applyStandaloneParams(params);
         try {
             const response = await fetch(`${threadPollEndpoint}?${params.toString()}`, {
                 headers: { Accept: 'application/json' },
@@ -3556,17 +3602,23 @@
             return;
         }
         stopPanelRefreshLoop();
-        const interval = getPanelRefreshInterval();
-        panelRefreshTimer = setInterval(() => {
+        const loop = () => {
             const hidden = document.hidden;
-            refreshPanels({ skipNotifications: hidden });
-        }, interval);
-        refreshPanels({ skipNotifications: document.hidden });
+            Promise.resolve(refreshPanels({ skipNotifications: hidden }))
+                .catch((error) => {
+                    console.error('Falha no loop de refresh das filas:', error);
+                })
+                .then(() => {
+                    const interval = getPanelRefreshInterval();
+                    panelRefreshTimer = setTimeout(loop, interval);
+                });
+        };
+        loop();
     }
 
     function stopPanelRefreshLoop() {
         if (panelRefreshTimer) {
-            clearInterval(panelRefreshTimer);
+            clearTimeout(panelRefreshTimer);
             panelRefreshTimer = null;
         }
         if (panelRefreshController) {
@@ -4240,6 +4292,9 @@
         if (document.hidden) {
             return THREAD_POLL_BACKGROUND_INTERVAL;
         }
+        if (!isUserIdle() && isStandalone) {
+            return 1200;
+        }
         if (isUserIdle()) {
             return THREAD_POLL_IDLE_INTERVAL;
         }
@@ -4249,6 +4304,9 @@
     function getPanelRefreshInterval() {
         if (document.hidden) {
             return PANEL_REFRESH_BACKGROUND_INTERVAL;
+        }
+        if (!isUserIdle() && isStandalone) {
+            return 3000;
         }
         if (isUserIdle()) {
             return PANEL_REFRESH_IDLE_INTERVAL;
